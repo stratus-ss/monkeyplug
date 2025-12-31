@@ -52,11 +52,13 @@ BEEP_MIX_NORMALIZE_DEFAULT = False
 BEEP_AUDIO_WEIGHT_DEFAULT = 1
 BEEP_SINE_WEIGHT_DEFAULT = 1
 BEEP_DROPOUT_TRANSITION_DEFAULT = 0
+CONFIDENCE_THRESHOLD_DEFAULT = 0.65
 SWEARS_FILENAME_DEFAULT = 'swears.txt'
 MUTAGEN_METADATA_TAGS = ['encodedby', 'comment']
 MUTAGEN_METADATA_TAG_VALUE = u'monkeyplug'
 SPEECH_REC_MODE_VOSK = "vosk"
 SPEECH_REC_MODE_WHISPER = "whisper"
+SPEECH_REC_MODE_REMOTE_WHISPER = "remote-whisper"
 DEFAULT_SPEECH_REC_MODE = os.getenv("MONKEYPLUG_MODE", SPEECH_REC_MODE_WHISPER)
 DEFAULT_VOSK_MODEL_DIR = os.getenv(
     "VOSK_MODEL_DIR", os.path.join(os.path.join(os.path.join(os.path.expanduser("~"), '.cache'), 'vosk'))
@@ -236,6 +238,8 @@ class Plugger(object):
         oAudioFileFormat,
         iSwearsFileSpec,
         outputJson,
+        inputTranscript=None,
+        saveTranscript=False,
         aParams=None,
         aChannels=AUDIO_DEFAULT_CHANNELS,
         aSampleRate=AUDIO_DEFAULT_SAMPLE_RATE,
@@ -247,6 +251,7 @@ class Plugger(object):
         beepAudioWeight=BEEP_AUDIO_WEIGHT_DEFAULT,
         beepSineWeight=BEEP_SINE_WEIGHT_DEFAULT,
         beepDropTransition=BEEP_DROPOUT_TRANSITION_DEFAULT,
+        confidenceThreshold=CONFIDENCE_THRESHOLD_DEFAULT,
         force=False,
         dbug=False,
     ):
@@ -258,9 +263,12 @@ class Plugger(object):
         self.beepAudioWeight = beepAudioWeight
         self.beepSineWeight = beepSineWeight
         self.beepDropTransition = beepDropTransition
+        self.confidenceThreshold = confidenceThreshold
         self.forceDespiteTag = force
         self.debug = dbug
         self.outputJson = outputJson
+        self.inputTranscript = inputTranscript
+        self.saveTranscript = saveTranscript
 
         # determine input file name, or download and save file
         if (iFileSpec is not None) and os.path.isfile(iFileSpec):
@@ -288,24 +296,25 @@ class Plugger(object):
         self.outputFileSpec = oFileSpec if oFileSpec else self.inputFileParts[0] + "_clean"
         if self.outputFileSpec:
             outParts = os.path.splitext(self.outputFileSpec)
-            if not oAudioFileFormat:
+            # Only use output file's extension if one exists and no format was specified
+            if not oAudioFileFormat and outParts[1]:
                 oAudioFileFormat = outParts[1]
 
         if str(oAudioFileFormat).upper() == AUDIO_MATCH_FORMAT:
             # output format not specified, base on input filename matching extension (or codec)
             if self.inputFileParts[1] in AUDIO_DEFAULT_PARAMS_BY_FORMAT:
-                self.outputFileSpec = self.outputFileSpec + self.inputFileParts[1]
+                self.outputFileSpec = outParts[0] + self.inputFileParts[1]
             elif str(inputFormat).lower() in AUDIO_DEFAULT_PARAMS_BY_FORMAT:
-                self.outputFileSpec = self.outputFileSpec + '.' + inputFormat.lower()
+                self.outputFileSpec = outParts[0] + '.' + inputFormat.lower()
             else:
                 for codec in mmguero.get_iterable(self.inputCodecs.get('audio', [])):
                     if codec.lower() in AUDIO_CODEC_TO_FORMAT:
-                        self.outputFileSpec = self.outputFileSpec + '.' + AUDIO_CODEC_TO_FORMAT[codec.lower()]
+                        self.outputFileSpec = outParts[0] + '.' + AUDIO_CODEC_TO_FORMAT[codec.lower()]
                         break
 
         elif oAudioFileFormat:
-            # output filename not specified, base on input filename with specified format
-            self.outputFileSpec = self.outputFileSpec + '.' + oAudioFileFormat.lower().lstrip('.')
+            # output filename specified with extension, use base name to avoid duplication
+            self.outputFileSpec = outParts[0] + '.' + oAudioFileFormat.lower().lstrip('.')
 
         else:
             # can't determine what output file audio format should be
@@ -348,23 +357,33 @@ class Plugger(object):
         if self.outputVideoFileFormat:
             self.outputFileSpec = outParts[0] + self.outputVideoFileFormat
 
+        # create output directory if it doesn't exist
+        self._ensure_directory_exists(self.outputFileSpec, "output directory")
+
         # if output file already exists, remove as we'll be overwriting it anyway
         if os.path.isfile(self.outputFileSpec):
             if self.debug:
                 mmguero.eprint(f'Removing existing destination file {self.outputFileSpec}')
             os.remove(self.outputFileSpec)
 
+        # If save-transcript is enabled and no explicit JSON output path, auto-generate one
+        if self.saveTranscript and not self.outputJson:
+            outputBaseName = os.path.splitext(self.outputFileSpec)[0]
+            self.outputJson = outputBaseName + '_transcript.json'
+            if self.debug:
+                mmguero.eprint(f'Auto-generated transcript output: {self.outputJson}')
+        
+        # If JSON output is specified, ensure its directory exists too
+        if self.outputJson:
+            self._ensure_directory_exists(self.outputJson, "JSON output directory")
+
         # load the swears file (not actually mapping right now, but who knows, speech synthesis maybe someday?)
         if (iSwearsFileSpec is not None) and os.path.isfile(iSwearsFileSpec):
             self.swearsFileSpec = iSwearsFileSpec
         else:
             raise IOError(errno.ENOENT, os.strerror(errno.ENOENT), iSwearsFileSpec)
-        lines = []
-        with open(self.swearsFileSpec) as f:
-            lines = [line.rstrip("\n") for line in f]
-        for line in lines:
-            lineMap = line.split("|")
-            self.swearsMap[scrubword(lineMap[0])] = lineMap[1] if len(lineMap) > 1 else "*****"
+        
+        self._load_swears_file()
 
         if self.debug:
             mmguero.eprint(f'Input: {self.inputFileSpec}')
@@ -374,6 +393,8 @@ class Plugger(object):
             mmguero.eprint(f'Encode parameters: {self.aParams}')
             mmguero.eprint(f'Profanity file: {self.swearsFileSpec}')
             mmguero.eprint(f'Intermediate downloaded file: {self.tmpDownloadedFileSpec}')
+            if self.outputJson:
+                mmguero.eprint(f'Transcript output: {self.outputJson}')
             mmguero.eprint(f'Beep instead of mute: {self.beep}')
             if self.beep:
                 mmguero.eprint(f'Beep hertz: {self.beepHertz}')
@@ -389,9 +410,114 @@ class Plugger(object):
         if os.path.isfile(self.tmpDownloadedFileSpec):
             os.remove(self.tmpDownloadedFileSpec)
 
+    ######## _ensure_directory_exists #############################################
+    def _ensure_directory_exists(self, filepath, description="directory"):
+        """Ensure the directory for a file path exists, creating it if necessary"""
+        directory = os.path.dirname(filepath)
+        if directory and not os.path.exists(directory):
+            if self.debug:
+                mmguero.eprint(f'Creating {description}: {directory}')
+            os.makedirs(directory, exist_ok=True)
+        return directory
+
+    ######## _load_swears_file ####################################################
+    def _load_swears_file(self):
+        """Load swears from text or JSON format"""
+        # Try to detect and parse JSON first
+        is_json = False
+        if self.swearsFileSpec.lower().endswith('.json'):
+            is_json = True
+        else:
+            # Try to parse as JSON even without .json extension
+            try:
+                with open(self.swearsFileSpec, 'r') as f:
+                    content = f.read()
+                    json.loads(content)
+                    is_json = True
+            except (json.JSONDecodeError, ValueError):
+                pass
+        
+        if is_json:
+            self._load_swears_from_json()
+        else:
+            self._load_swears_from_text()
+        
+        if self.debug:
+            mmguero.eprint(f'Loaded {len(self.swearsMap)} profanity entries from {self.swearsFileSpec}')
+    
+    def _load_swears_from_json(self):
+        """Load swears from JSON format - simple array of strings
+        
+        Format: ["word1", "word2", "word3", ...]
+        Example: https://github.com/zautumnz/profane-words/blob/master/words.json
+        """
+        with open(self.swearsFileSpec, 'r') as f:
+            data = json.load(f)
+        
+        if not isinstance(data, list):
+            raise ValueError(f"JSON swears file must contain an array of strings, got {type(data).__name__}")
+        
+        for item in data:
+            if isinstance(item, str) and item.strip():
+                self.swearsMap[scrubword(item)] = "*****"
+    
+    def _load_swears_from_text(self):
+        """Load swears from pipe-delimited text format (legacy)"""
+        lines = []
+        with open(self.swearsFileSpec) as f:
+            lines = [line.rstrip("\n") for line in f]
+        for line in lines:
+            lineMap = line.split("|")
+            self.swearsMap[scrubword(lineMap[0])] = lineMap[1] if len(lineMap) > 1 else "*****"
+
+    ######## _should_scrub_word ##################################################
+    def _should_scrub_word(self, word_text, confidence=1.0):
+        """Check if a word should be scrubbed based on swears list and confidence threshold
+        
+        Args:
+            word_text: The word to check
+            confidence: Confidence score (0.0 to 1.0), defaults to 1.0
+            
+        Returns:
+            bool: True if word should be scrubbed, False otherwise
+        """
+        return (scrubword(word_text) in self.swearsMap and 
+                confidence >= self.confidenceThreshold)
+
+    ######## LoadTranscriptFromFile ##############################################
+    def LoadTranscriptFromFile(self):
+        """Load pre-generated transcript from JSON file"""
+        if not self.inputTranscript:
+            return False
+        
+        if not os.path.isfile(self.inputTranscript):
+            raise IOError(errno.ENOENT, os.strerror(errno.ENOENT), self.inputTranscript)
+        
+        if self.debug:
+            mmguero.eprint(f'Loading transcript from: {self.inputTranscript}')
+        
+        with open(self.inputTranscript, 'r') as f:
+            self.wordList = json.load(f)
+        
+        # Recalculate scrub flags with current swears list and confidence threshold
+        for word in self.wordList:
+            word['scrub'] = self._should_scrub_word(
+                word.get('word', ''), 
+                word.get('conf', 1.0)
+            )
+        
+        if self.debug:
+            mmguero.eprint(f'Loaded {len(self.wordList)} words from transcript')
+            scrubbed_count = sum(1 for w in self.wordList if w.get('scrub', False))
+            mmguero.eprint(f'Words to censor with current swear list: {scrubbed_count}')
+        
+        return True
+
     ######## CreateCleanMuteList #################################################
     def CreateCleanMuteList(self):
-        self.RecognizeSpeech()
+        # Try to load existing transcript first, otherwise perform speech recognition
+        if not self.LoadTranscriptFromFile():
+            self.RecognizeSpeech()
 
         self.naughtyWordList = [word for word in self.wordList if word["scrub"] is True]
         if len(self.naughtyWordList) > 0:
@@ -532,6 +658,8 @@ class VoskPlugger(Plugger):
         iSwearsFileSpec,
         mDir,
         outputJson,
+        inputTranscript=None,
+        saveTranscript=False,
         aParams=None,
         aChannels=AUDIO_DEFAULT_CHANNELS,
         aSampleRate=AUDIO_DEFAULT_SAMPLE_RATE,
@@ -544,26 +672,31 @@ class VoskPlugger(Plugger):
         beepAudioWeight=BEEP_AUDIO_WEIGHT_DEFAULT,
         beepSineWeight=BEEP_SINE_WEIGHT_DEFAULT,
         beepDropTransition=BEEP_DROPOUT_TRANSITION_DEFAULT,
+        confidenceThreshold=CONFIDENCE_THRESHOLD_DEFAULT,
         force=False,
         dbug=False,
     ):
         self.wavReadFramesChunk = wChunk
+        self.modelPath = None
+        self.vosk = None
 
-        # make sure the VOSK model path exists
-        if (mDir is not None) and os.path.isdir(mDir):
-            self.modelPath = mDir
-        else:
-            raise IOError(
-                errno.ENOENT,
-                os.strerror(errno.ENOENT) + " (see https://alphacephei.com/vosk/models)",
-                mDir,
-            )
+        # Only load model if we're actually going to transcribe (no input transcript provided)
+        if not inputTranscript:
+            # make sure the VOSK model path exists
+            if (mDir is not None) and os.path.isdir(mDir):
+                self.modelPath = mDir
+            else:
+                raise IOError(
+                    errno.ENOENT,
+                    os.strerror(errno.ENOENT) + " (see https://alphacephei.com/vosk/models)",
+                    mDir,
+                )
 
-        self.vosk = mmguero.dynamic_import("vosk", "vosk", debug=dbug)
-        if not self.vosk:
-            raise Exception(f"Unable to initialize VOSK API")
-        if not dbug:
-            self.vosk.SetLogLevel(-1)
+            self.vosk = mmguero.dynamic_import("vosk", "vosk", debug=dbug)
+            if not self.vosk:
+                raise Exception(f"Unable to initialize VOSK API")
+            if not dbug:
+                self.vosk.SetLogLevel(-1)
 
         super().__init__(
             iFileSpec=iFileSpec,
@@ -571,6 +704,8 @@ class VoskPlugger(Plugger):
             oAudioFileFormat=oAudioFileFormat,
             iSwearsFileSpec=iSwearsFileSpec,
             outputJson=outputJson,
+            inputTranscript=inputTranscript,
+            saveTranscript=saveTranscript,
             aParams=aParams,
             aChannels=aChannels,
             aSampleRate=aSampleRate,
@@ -582,6 +717,7 @@ class VoskPlugger(Plugger):
             beepAudioWeight=beepAudioWeight,
             beepSineWeight=beepSineWeight,
             beepDropTransition=beepDropTransition,
+            confidenceThreshold=confidenceThreshold,
             force=force,
             dbug=dbug,
         )
@@ -589,9 +725,12 @@ class VoskPlugger(Plugger):
         self.tmpWavFileSpec = self.inputFileParts[0] + ".wav"
 
         if self.debug:
-            mmguero.eprint(f'Model directory: {self.modelPath}')
-            mmguero.eprint(f'Intermediate audio file: {self.tmpWavFileSpec}')
-            mmguero.eprint(f'Read frames: {self.wavReadFramesChunk}')
+            if inputTranscript:
+                mmguero.eprint(f'Using input transcript (skipping speech recognition)')
+            else:
+                mmguero.eprint(f'Model directory: {self.modelPath}')
+                mmguero.eprint(f'Intermediate audio file: {self.tmpWavFileSpec}')
+                mmguero.eprint(f'Read frames: {self.wavReadFramesChunk}')
 
     def __del__(self):
         super().__del__()
@@ -650,7 +789,10 @@ class VoskPlugger(Plugger):
                     if "result" in res:
                         self.wordList.extend(
                             [
-                                dict(r, **{'scrub': scrubword(mmguero.deep_get(r, ["word"])) in self.swearsMap})
+                                dict(r, **{'scrub': self._should_scrub_word(
+                                    mmguero.deep_get(r, ["word"]), 
+                                    mmguero.deep_get(r, ["conf"], 1.0)
+                                )})
                                 for r in res["result"]
                             ]
                         )
@@ -658,7 +800,10 @@ class VoskPlugger(Plugger):
             if "result" in res:
                 self.wordList.extend(
                     [
-                        dict(r, **{'scrub': scrubword(mmguero.deep_get(r, ["word"])) in self.swearsMap})
+                        dict(r, **{'scrub': self._should_scrub_word(
+                            mmguero.deep_get(r, ["word"]), 
+                            mmguero.deep_get(r, ["conf"], 1.0)
+                        )})
                         for r in res["result"]
                     ]
                 )
@@ -683,6 +828,9 @@ class WhisperPlugger(Plugger):
     torch = None
     whisper = None
     transcript = None
+    remote_url = None
+    api_timeout = 600
+    poll_interval = 5
 
     def __init__(
         self,
@@ -694,6 +842,11 @@ class WhisperPlugger(Plugger):
         mName,
         torchThreads,
         outputJson,
+        inputTranscript=None,
+        saveTranscript=False,
+        remoteUrl=None,
+        apiTimeout=600,
+        pollInterval=5,
         aParams=None,
         aChannels=AUDIO_DEFAULT_CHANNELS,
         aSampleRate=AUDIO_DEFAULT_SAMPLE_RATE,
@@ -705,21 +858,41 @@ class WhisperPlugger(Plugger):
         beepAudioWeight=BEEP_AUDIO_WEIGHT_DEFAULT,
         beepSineWeight=BEEP_SINE_WEIGHT_DEFAULT,
         beepDropTransition=BEEP_DROPOUT_TRANSITION_DEFAULT,
+        confidenceThreshold=CONFIDENCE_THRESHOLD_DEFAULT,
         force=False,
         dbug=False,
     ):
-        if torchThreads > 0:
-            self.torch = mmguero.dynamic_import("torch", "torch", debug=dbug)
-            if self.torch:
-                self.torch.set_num_threads(torchThreads)
+        # Handle remote URL - add http:// if no scheme provided
+        if remoteUrl:
+            original_url = remoteUrl
+            remoteUrl = remoteUrl.rstrip('/')
+            if not remoteUrl.startswith(('http://', 'https://')):
+                remoteUrl = f'http://{remoteUrl}'
+                if dbug:
+                    mmguero.eprint(f'Adding http:// to URL: {original_url} -> {remoteUrl}')
+        self.remote_url = remoteUrl
+        self.api_timeout = apiTimeout
+        self.poll_interval = pollInterval
+        self.whisper = None
+        self.model = None
+        self.torch = None
 
-        self.whisper = mmguero.dynamic_import("whisper", "openai-whisper", debug=dbug)
-        if not self.whisper:
-            raise Exception("Unable to initialize Whisper API")
+        # Only load model if we're actually going to transcribe (no input transcript provided)
+        if not inputTranscript:
+            # Only load local model if not using remote
+            if not self.remote_url:
+                if torchThreads > 0:
+                    self.torch = mmguero.dynamic_import("torch", "torch", debug=dbug)
+                    if self.torch:
+                        self.torch.set_num_threads(torchThreads)
 
-        self.model = self.whisper.load_model(mName, download_root=mDir)
-        if not self.model:
-            raise Exception(f"Unable to load Whisper model {mName} in {mDir}")
+                self.whisper = mmguero.dynamic_import("whisper", "openai-whisper", debug=dbug)
+                if not self.whisper:
+                    raise Exception("Unable to initialize Whisper API")
+
+                self.model = self.whisper.load_model(mName, download_root=mDir)
+                if not self.model:
+                    raise Exception(f"Unable to load Whisper model {mName} in {mDir}")
 
         super().__init__(
             iFileSpec=iFileSpec,
@@ -727,6 +900,8 @@ class WhisperPlugger(Plugger):
             oAudioFileFormat=oAudioFileFormat,
             iSwearsFileSpec=iSwearsFileSpec,
             outputJson=outputJson,
+            inputTranscript=inputTranscript,
+            saveTranscript=saveTranscript,
             aParams=aParams,
             aChannels=aChannels,
             aSampleRate=aSampleRate,
@@ -738,13 +913,21 @@ class WhisperPlugger(Plugger):
             beepAudioWeight=beepAudioWeight,
             beepSineWeight=beepSineWeight,
             beepDropTransition=beepDropTransition,
+            confidenceThreshold=confidenceThreshold,
             force=force,
             dbug=dbug,
         )
 
         if self.debug:
-            mmguero.eprint(f'Model directory: {mDir}')
-            mmguero.eprint(f'Model name: {mName}')
+            if inputTranscript:
+                mmguero.eprint(f'Using input transcript (skipping speech recognition)')
+            elif self.remote_url:
+                mmguero.eprint(f'Remote Whisper URL: {self.remote_url}')
+                mmguero.eprint(f'API Timeout: {self.api_timeout}')
+                mmguero.eprint(f'Poll Interval: {self.poll_interval}')
+            else:
+                mmguero.eprint(f'Model directory: {mDir}')
+                mmguero.eprint(f'Model name: {mName}')
 
     def __del__(self):
         super().__del__()
@@ -752,14 +935,10 @@ class WhisperPlugger(Plugger):
     def RecognizeSpeech(self):
         self.wordList.clear()
 
-        self.transcript = self.model.transcribe(word_timestamps=True, audio=self.inputFileSpec)
-        if self.transcript and ('segments' in self.transcript):
-            for segment in self.transcript['segments']:
-                if 'words' in segment:
-                    for word in segment['words']:
-                        word['word'] = word['word'].strip()
-                        word['scrub'] = scrubword(word['word']) in self.swearsMap
-                        self.wordList.append(word)
+        if self.remote_url:
+            self._RecognizeSpeechRemote()
+        else:
+            self._RecognizeSpeechLocal()
 
         if self.debug:
             mmguero.eprint(json.dumps(self.wordList))
@@ -770,11 +949,131 @@ class WhisperPlugger(Plugger):
 
         return self.wordList
 
+    def _RecognizeSpeechLocal(self):
+        """Local Whisper transcription"""
+        self.transcript = self.model.transcribe(word_timestamps=True, audio=self.inputFileSpec)
+        if self.transcript and ('segments' in self.transcript):
+            for segment in self.transcript['segments']:
+                if 'words' in segment:
+                    for word in segment['words']:
+                        word['word'] = word['word'].strip()
+                        # Whisper provides 'probability' field for confidence
+                        word['scrub'] = self._should_scrub_word(
+                            word['word'], 
+                            word.get('probability', 1.0)
+                        )
+                        self.wordList.append(word)
 
-#################################################################################
+    def _RecognizeSpeechRemote(self):
+        """Remote Whisper transcription using async task pattern"""
+        try:
+            task_id = self._upload_audio_for_transcription()
+            result = self._poll_for_transcription_result(task_id)
+            self._extract_words_from_result(result)
+        except requests.exceptions.RequestException as e:
+            mmguero.eprint(f"Error communicating with remote service: {e}")
+            raise
 
+    def _upload_audio_for_transcription(self):
+        """Upload audio file to remote service and get task ID"""
+        with open(self.inputFileSpec, 'rb') as f:
+            files = {'file': f}
+            data = {'word_timestamps': True}
+            
+            if self.debug:
+                mmguero.eprint(f'Uploading to {self.remote_url}/transcription/')
+            
+            response = requests.post(
+                f'{self.remote_url}/transcription/',
+                files=files,
+                data=data,
+                timeout=self.api_timeout
+            )
+            response.raise_for_status()
+            response_data = response.json()
+            
+            task_id = response_data.get('identifier')
+            if not task_id:
+                raise ValueError(f"No task identifier in response: {response_data}")
+            
+            if self.debug:
+                mmguero.eprint(f'Task ID: {task_id}')
+            
+            return task_id
 
-###################################################################################################
+    def _poll_for_transcription_result(self, task_id):
+        """Poll remote service until transcription completes and return result"""
+        import time
+        
+        while True:
+            response = requests.get(f'{self.remote_url}/task/{task_id}')
+            response.raise_for_status()
+            data = response.json()
+            
+            status = data.get('status')
+            
+            if self.debug:
+                progress = data.get('progress', 0)
+                mmguero.eprint(f'Status: {status}, Progress: {progress:.1%}')
+            
+            if status == 'completed':
+                return data.get('result', [])
+            elif status in ['failed', 'error']:
+                error_msg = data.get('error', 'Unknown error')
+                raise RuntimeError(f'Transcription failed: {error_msg}')
+            
+            time.sleep(self.poll_interval)
+
+    def _extract_words_from_result(self, result):
+        """Extract words from transcription result and add to word list"""
+        if not isinstance(result, list) or len(result) == 0:
+            return
+        
+        # Check if result has word-level timestamps (native Whisper format)
+        has_word_timestamps = 'words' in result[0] if result else False
+        
+        if has_word_timestamps:
+            if self.debug:
+                mmguero.eprint('Using native Whisper word-level timestamps')
+            for segment in result:
+                if 'words' in segment:
+                    for word in segment['words']:
+                        word_text = word.get('word', '').strip()
+                        if word_text:
+                            word_conf = word.get('probability', 1.0)
+                            self.wordList.append({
+                                'word': word_text,
+                                'start': word.get('start', 0),
+                                'end': word.get('end', 0),
+                                'conf': word_conf,
+                                'scrub': self._should_scrub_word(word_text, word_conf)
+                            })
+        else:
+            # Fallback: estimate word timing from segment-level timestamps
+            if self.debug:
+                mmguero.eprint('Word timestamps not available, estimating from segments')
+            for segment in result:
+                text = segment.get('text', '').strip()
+                if not text:
+                    continue
+                
+                words = text.split()
+                start = segment.get('start', 0)
+                end = segment.get('end', 0)
+                duration = end - start
+                word_duration = duration / len(words) if words else 0
+                
+                for idx, word_text in enumerate(words):
+                    word_start = start + (idx * word_duration)
+                    word_end = word_start + word_duration
+                    self.wordList.append({
+                        'word': word_text,
+                        'start': word_start,
+                        'end': word_end,
+                        'conf': 1.0,
+                        'scrub': self._should_scrub_word(word_text, 1.0)
+                    })
+
 # RunMonkeyPlug
 def RunMonkeyPlug():
     parser = argparse.ArgumentParser(
@@ -800,7 +1099,7 @@ def RunMonkeyPlug():
         metavar="<string>",
         type=str,
         default=DEFAULT_SPEECH_REC_MODE,
-        help=f"Speech recognition engine ({SPEECH_REC_MODE_WHISPER}|{SPEECH_REC_MODE_VOSK}) (default: {DEFAULT_SPEECH_REC_MODE})",
+        help=f"Speech recognition engine ({SPEECH_REC_MODE_WHISPER}|{SPEECH_REC_MODE_VOSK}|{SPEECH_REC_MODE_REMOTE_WHISPER}) (default: {DEFAULT_SPEECH_REC_MODE})",
     )
     parser.add_argument(
         "-i",
@@ -832,11 +1131,35 @@ def RunMonkeyPlug():
         help="Output file to store transcript JSON",
     )
     parser.add_argument(
+        "--input-transcript",
+        dest="inputTranscript",
+        type=str,
+        default=None,
+        required=False,
+        metavar="<string>",
+        help="Load existing transcript JSON instead of performing speech recognition",
+    )
+    parser.add_argument(
+        "--save-transcript",
+        dest="saveTranscript",
+        action="store_true",
+        default=False,
+        help="Automatically save transcript JSON alongside output audio file (default: true)",
+    )
+    parser.add_argument(
         "-w",
         "--swears",
         help=f"text file containing profanity (default: \"{SWEARS_FILENAME_DEFAULT}\")",
         default=os.path.join(script_path, SWEARS_FILENAME_DEFAULT),
         metavar="<profanity file>",
+    )
+    parser.add_argument(
+        "--confidence-threshold",
+        dest="confidenceThreshold",
+        metavar="<float>",
+        type=float,
+        default=CONFIDENCE_THRESHOLD_DEFAULT,
+        help=f"Minimum confidence level (0.0-1.0) required to censor a word (default: {CONFIDENCE_THRESHOLD_DEFAULT})",
     )
     parser.add_argument(
         "-a",
@@ -1007,6 +1330,32 @@ def RunMonkeyPlug():
         help=f"Number of threads used by torch for CPU inference ({DEFAULT_TORCH_THREADS})",
     )
 
+    remoteWhisperArgGroup = parser.add_argument_group('Remote Whisper Options')
+    remoteWhisperArgGroup.add_argument(
+        "--remote-whisper-url",
+        dest="remoteWhisperUrl",
+        metavar="<string>",
+        type=str,
+        default=os.getenv("REMOTE_WHISPER_URL", None),
+        help="Remote Whisper service URL (e.g., http://localhost:8000)",
+    )
+    remoteWhisperArgGroup.add_argument(
+        "--remote-whisper-timeout",
+        dest="remoteWhisperTimeout",
+        metavar="<int>",
+        type=int,
+        default=600,
+        help="Timeout for remote API requests in seconds (default: 600)",
+    )
+    remoteWhisperArgGroup.add_argument(
+        "--remote-whisper-poll-interval",
+        dest="remoteWhisperPollInterval",
+        metavar="<int>",
+        type=int,
+        default=5,
+        help="Poll interval for checking remote task status in seconds (default: 5)",
+    )
+
     try:
         parser.error = parser.exit
         args = parser.parse_args()
@@ -1031,6 +1380,8 @@ def RunMonkeyPlug():
             args.swears,
             args.voskModelDir,
             args.outputJson,
+            inputTranscript=args.inputTranscript,
+            saveTranscript=args.saveTranscript,
             aParams=args.aParams,
             aChannels=args.aChannels,
             aSampleRate=args.aSampleRate,
@@ -1043,12 +1394,23 @@ def RunMonkeyPlug():
             beepAudioWeight=args.beepAudioWeight,
             beepSineWeight=args.beepSineWeight,
             beepDropTransition=args.beepDropTransition,
+            confidenceThreshold=args.confidenceThreshold,
             force=args.forceDespiteTag,
             dbug=args.debug,
         )
 
-    elif args.speechRecMode == SPEECH_REC_MODE_WHISPER:
-        pathlib.Path(args.whisperModelDir).mkdir(parents=True, exist_ok=True)
+    elif args.speechRecMode in [SPEECH_REC_MODE_WHISPER, SPEECH_REC_MODE_REMOTE_WHISPER]:
+        # Use remote if mode is remote-whisper OR if remote URL is provided
+        use_remote = (args.speechRecMode == SPEECH_REC_MODE_REMOTE_WHISPER) or args.remoteWhisperUrl
+        
+        if use_remote:
+            if not args.remoteWhisperUrl:
+                raise ValueError("Remote Whisper URL must be specified with --remote-whisper-url or REMOTE_WHISPER_URL environment variable")
+            remote_url = args.remoteWhisperUrl
+        else:
+            pathlib.Path(args.whisperModelDir).mkdir(parents=True, exist_ok=True)
+            remote_url = None
+        
         plug = WhisperPlugger(
             args.input,
             args.output,
@@ -1058,6 +1420,11 @@ def RunMonkeyPlug():
             args.whisperModelName,
             args.torchThreads,
             args.outputJson,
+            inputTranscript=args.inputTranscript,
+            saveTranscript=args.saveTranscript,
+            remoteUrl=remote_url,
+            apiTimeout=args.remoteWhisperTimeout,
+            pollInterval=args.remoteWhisperPollInterval,
             aParams=args.aParams,
             aChannels=args.aChannels,
             aSampleRate=args.aSampleRate,
@@ -1069,9 +1436,11 @@ def RunMonkeyPlug():
             beepAudioWeight=args.beepAudioWeight,
             beepSineWeight=args.beepSineWeight,
             beepDropTransition=args.beepDropTransition,
+            confidenceThreshold=args.confidenceThreshold,
             force=args.forceDespiteTag,
             dbug=args.debug,
         )
+    
     else:
         raise ValueError(f"Unsupported speech recognition engine {args.speechRecMode}")
 
