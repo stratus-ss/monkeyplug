@@ -13,10 +13,24 @@ import requests
 import shutil
 import string
 import sys
+import tempfile
 import wave
 
 from urllib.parse import urlparse
 from itertools import tee
+
+try:
+    from monkeyplug.audio_chunker import AudioChunker
+except ImportError:
+    AudioChunker = None
+
+from monkeyplug.utilities import (
+    FFmpegCommandBuilder,
+    AudioFilterBuilder,
+    FFmpegRunner,
+    TranscriptManager,
+    get_codecs as get_codecs_util
+)
 
 ###################################################################################################
 CHANNELS_REPLACER = 'CHANNELS'
@@ -162,40 +176,8 @@ def SetMonkeyplugTag(local_filename, debug=False):
 # get stream codecs from an input filename
 # e.g. result: {'video': {'h264'}, 'audio': {'eac3'}, 'subtitle': {'subrip'}}
 def GetCodecs(local_filename, debug=False):
-    result = {}
-    if os.path.isfile(local_filename):
-        ffprobeCmd = [
-            'ffprobe',
-            '-v',
-            'quiet',
-            '-print_format',
-            'json',
-            '-show_format',
-            '-show_streams',
-            local_filename,
-        ]
-        ffprobeResult, ffprobeOutput = mmguero.run_process(ffprobeCmd, stdout=True, stderr=False, debug=debug)
-        if ffprobeResult == 0:
-            ffprobeOutput = mmguero.load_str_if_json(' '.join(ffprobeOutput))
-            if 'streams' in ffprobeOutput:
-                for stream in ffprobeOutput['streams']:
-                    if 'codec_name' in stream and 'codec_type' in stream:
-                        cType = stream['codec_type'].lower()
-                        cValue = stream['codec_name'].lower()
-                        if cType in result:
-                            result[cType].add(cValue)
-                        else:
-                            result[cType] = set([cValue])
-            result['format'] = mmguero.deep_get(ffprobeOutput, ['format', 'format_name'])
-            if isinstance(result['format'], str):
-                result['format'] = result['format'].split(',')
-        else:
-            mmguero.eprint(' '.join(mmguero.flatten(ffprobeCmd)))
-            mmguero.eprint(ffprobeResult)
-            mmguero.eprint(ffprobeOutput)
-            raise ValueError(f"Could not analyze {local_filename}")
-
-    return result
+    """Wrapper for get_codecs from utilities module."""
+    return get_codecs_util(local_filename, debug=debug)
 
 
 #################################################################################
@@ -253,6 +235,10 @@ class Plugger(object):
         beepDropTransition=BEEP_DROPOUT_TRANSITION_DEFAULT,
         confidenceThreshold=CONFIDENCE_THRESHOLD_DEFAULT,
         force=False,
+        useChunking=False,
+        chunkingWorkDir=None,
+        parallelEncoding=False,
+        maxWorkers=None,
         dbug=False,
     ):
         self.padSecPre = padMsecPre / 1000.0
@@ -269,6 +255,10 @@ class Plugger(object):
         self.outputJson = outputJson
         self.inputTranscript = inputTranscript
         self.saveTranscript = saveTranscript
+        self.useChunking = useChunking
+        self.chunkingWorkDir = chunkingWorkDir if chunkingWorkDir else tempfile.gettempdir()
+        self.parallelEncoding = parallelEncoding
+        self.maxWorkers = maxWorkers
 
         # determine input file name, or download and save file
         if (iFileSpec is not None) and os.path.isfile(iFileSpec):
@@ -493,23 +483,12 @@ class Plugger(object):
         if not os.path.isfile(self.inputTranscript):
             raise IOError(errno.ENOENT, os.strerror(errno.ENOENT), self.inputTranscript)
         
-        if self.debug:
-            mmguero.eprint(f'Loading transcript from: {self.inputTranscript}')
-        
-        with open(self.inputTranscript, 'r') as f:
-            self.wordList = json.load(f)
-        
-        # Recalculate scrub flags with current swears list and confidence threshold
-        for word in self.wordList:
-            word['scrub'] = self._should_scrub_word(
-                word.get('word', ''), 
-                word.get('conf', 1.0)
-            )
-        
-        if self.debug:
-            mmguero.eprint(f'Loaded {len(self.wordList)} words from transcript')
-            scrubbed_count = sum(1 for w in self.wordList if w.get('scrub', False))
-            mmguero.eprint(f'Words to censor with current swear list: {scrubbed_count}')
+        self.wordList = TranscriptManager.load_transcript(
+            transcript_path=self.inputTranscript,
+            swears_map=self.swearsMap,
+            confidence_threshold=self.confidenceThreshold,
+            debug=self.debug
+        )
         
         return True
 
@@ -540,23 +519,25 @@ class Plugger(object):
         self.sineTimeList = []
         self.beepDelayList = []
         for word, wordPeek in pairwise(self.naughtyWordList):
-            wordStart = format(word["start"] - self.padSecPre, ".3f")
-            wordEnd = format(word["end"] + self.padSecPost, ".3f")
-            wordDuration = format(float(wordEnd) - float(wordStart), ".3f")
-            wordPeekStart = format(wordPeek["start"] - self.padSecPre, ".3f")
+            wordStart = word["start"] - self.padSecPre
+            wordEnd = word["end"] + self.padSecPost
+            wordPeekStart = wordPeek["start"] - self.padSecPre
+            
             if self.beep:
-                self.muteTimeList.append(f"volume=enable='between(t,{wordStart},{wordEnd})':volume=0")
-                self.sineTimeList.append(f"sine=f={self.beepHertz}:duration={wordDuration}")
-                self.beepDelayList.append(
-                    f"atrim=0:{wordDuration},adelay={'|'.join([str(int(float(wordStart) * 1000))] * 2)}"
+                # Use utilities module to build beep entries
+                mute_entry, sine_entry, delay_entry = AudioFilterBuilder.create_beep_entries(
+                    wordStart, wordEnd, self.beepHertz
                 )
+                self.muteTimeList.append(mute_entry)
+                self.sineTimeList.append(sine_entry)
+                self.beepDelayList.append(delay_entry)
             else:
-                self.muteTimeList.append(
-                    "afade=enable='between(t," + wordStart + "," + wordEnd + ")':t=out:st=" + wordStart + ":d=5ms"
+                # Use utilities module to build mute entries
+                fade_out, fade_in = AudioFilterBuilder.create_mute_time_entry(
+                    wordStart, wordEnd, wordPeekStart
                 )
-                self.muteTimeList.append(
-                    "afade=enable='between(t," + wordEnd + "," + wordPeekStart + ")':t=in:st=" + wordEnd + ":d=5ms"
-                )
+                self.muteTimeList.append(fade_out)
+                self.muteTimeList.append(fade_in)
 
         if self.debug:
             mmguero.eprint(self.muteTimeList)
@@ -569,68 +550,53 @@ class Plugger(object):
     ######## EncodeCleanAudio ####################################################
     def EncodeCleanAudio(self):
         if (self.forceDespiteTag is True) or (GetMonkeyplugTagged(self.inputFileSpec, debug=self.debug) is False):
+            # Check if we should use chunking for large files
+            if self.useChunking and AudioChunker:
+                chunker = AudioChunker(
+                    working_dir=self.chunkingWorkDir,
+                    plugger=self,
+                    parallel_encoding=self.parallelEncoding,
+                    max_workers=self.maxWorkers
+                )
+                if chunker.needs_chunking(self.inputFileSpec):
+                    if self.debug:
+                        mmguero.eprint("File exceeds size threshold, using chunked processing")
+                    chunker.process_with_chunking(
+                        source_file=self.inputFileSpec,
+                        output_file=self.outputFileSpec
+                    )
+                    SetMonkeyplugTag(self.outputFileSpec, debug=self.debug)
+                    return self.outputFileSpec
+            
+            # Normal (non-chunked) processing
             self.CreateCleanMuteList()
 
+            # Build audio filter arguments using utilities module
             if len(self.muteTimeList) > 0:
                 if self.beep:
-                    muteTimeListStr = ','.join(self.muteTimeList)
-                    sineTimeListStr = ';'.join([f'{val}[beep{i+1}]' for i, val in enumerate(self.sineTimeList)])
-                    beepDelayList = ';'.join(
-                        [f'[beep{i+1}]{val}[beep{i+1}_delayed]' for i, val in enumerate(self.beepDelayList)]
+                    audioArgs = AudioFilterBuilder.build_beep_filters(
+                        self.muteTimeList,
+                        self.sineTimeList,
+                        self.beepDelayList,
+                        mix_normalize=self.beepMixNormalize,
+                        audio_weight=self.beepAudioWeight,
+                        sine_weight=self.beepSineWeight,
+                        dropout_transition=self.beepDropTransition
                     )
-                    beepMixList = ''.join([f'[beep{i+1}_delayed]' for i in range(len(self.beepDelayList))])
-                    filterStr = f"[0:a]{muteTimeListStr}[mute];{sineTimeListStr};{beepDelayList};[mute]{beepMixList}amix=inputs={len(self.beepDelayList)+1}:normalize={str(self.beepMixNormalize).lower()}:dropout_transition={self.beepDropTransition}:weights={self.beepAudioWeight} {' '.join([str(self.beepSineWeight)] * len(self.beepDelayList))}"
-                    audioArgs = ['-filter_complex', filterStr]
                 else:
-                    audioArgs = ['-af', ",".join(self.muteTimeList)]
+                    audioArgs = AudioFilterBuilder.build_mute_filters(self.muteTimeList)
             else:
                 audioArgs = []
 
-            if self.outputVideoFileFormat:
-                # replace existing audio stream in video file with -copy
-                ffmpegCmd = [
-                    'ffmpeg',
-                    '-nostdin',
-                    '-hide_banner',
-                    '-nostats',
-                    '-loglevel',
-                    'error',
-                    '-y',
-                    '-i',
-                    self.inputFileSpec,
-                    '-c:v',
-                    'copy',
-                    '-sn',
-                    '-dn',
-                    audioArgs,
-                    self.aParams,
-                    self.outputFileSpec,
-                ]
-
-            else:
-                ffmpegCmd = [
-                    'ffmpeg',
-                    '-nostdin',
-                    '-hide_banner',
-                    '-nostats',
-                    '-loglevel',
-                    'error',
-                    '-y',
-                    '-i',
-                    self.inputFileSpec,
-                    '-vn',
-                    '-sn',
-                    '-dn',
-                    audioArgs,
-                    self.aParams,
-                    self.outputFileSpec,
-                ]
-            ffmpegResult, ffmpegOutput = mmguero.run_process(ffmpegCmd, stdout=True, stderr=True, debug=self.debug)
-            if (ffmpegResult != 0) or (not os.path.isfile(self.outputFileSpec)):
-                mmguero.eprint(' '.join(mmguero.flatten(ffmpegCmd)))
-                mmguero.eprint(ffmpegResult)
-                mmguero.eprint(ffmpegOutput)
-                raise ValueError(f"Could not process {self.inputFileSpec}")
+            # Use utilities module to run ffmpeg command
+            FFmpegRunner.run_encode(
+                input_file=self.inputFileSpec,
+                output_file=self.outputFileSpec,
+                audio_params=self.aParams,
+                audio_args=audioArgs,
+                video_mode=bool(self.outputVideoFileFormat),
+                debug=self.debug
+            )
 
             SetMonkeyplugTag(self.outputFileSpec, debug=self.debug)
 
@@ -674,6 +640,10 @@ class VoskPlugger(Plugger):
         beepDropTransition=BEEP_DROPOUT_TRANSITION_DEFAULT,
         confidenceThreshold=CONFIDENCE_THRESHOLD_DEFAULT,
         force=False,
+        useChunking=False,
+        chunkingWorkDir=None,
+        parallelEncoding=False,
+        maxWorkers=None,
         dbug=False,
     ):
         self.wavReadFramesChunk = wChunk
@@ -719,6 +689,10 @@ class VoskPlugger(Plugger):
             beepDropTransition=beepDropTransition,
             confidenceThreshold=confidenceThreshold,
             force=force,
+            useChunking=useChunking,
+            chunkingWorkDir=chunkingWorkDir,
+            parallelEncoding=parallelEncoding,
+            maxWorkers=maxWorkers,
             dbug=dbug,
         )
 
@@ -739,23 +713,13 @@ class VoskPlugger(Plugger):
             os.remove(self.tmpWavFileSpec)
 
     def CreateIntermediateWAV(self):
-        ffmpegCmd = [
-            'ffmpeg',
-            '-nostdin',
-            '-hide_banner',
-            '-nostats',
-            '-loglevel',
-            'error',
-            '-y',
-            '-i',
+        """Create intermediate WAV file for VOSK speech recognition."""
+        ffmpegCmd = FFmpegCommandBuilder.build_intermediate_wav_command(
             self.inputFileSpec,
-            '-vn',
-            '-sn',
-            '-dn',
-            AUDIO_INTERMEDIATE_PARAMS,
             self.tmpWavFileSpec,
-        ]
-        ffmpegResult, ffmpegOutput = mmguero.run_process(ffmpegCmd, stdout=True, stderr=True, debug=self.debug)
+            AUDIO_INTERMEDIATE_PARAMS
+        )
+        ffmpegResult, ffmpegOutput = FFmpegRunner.run_command(ffmpegCmd, debug=self.debug)
         if (ffmpegResult != 0) or (not os.path.isfile(self.tmpWavFileSpec)):
             mmguero.eprint(' '.join(mmguero.flatten(ffmpegCmd)))
             mmguero.eprint(ffmpegResult)
@@ -763,7 +727,6 @@ class VoskPlugger(Plugger):
             raise ValueError(
                 f"Could not convert {self.inputFileSpec} to {self.tmpWavFileSpec} (16 kHz, mono, s16 PCM WAV)"
             )
-
         return self.inputFileSpec
 
     def RecognizeSpeech(self):
@@ -812,8 +775,11 @@ class VoskPlugger(Plugger):
                 mmguero.eprint(json.dumps(self.wordList))
 
             if self.outputJson:
-                with open(self.outputJson, "w") as f:
-                    f.write(json.dumps(self.wordList))
+                TranscriptManager.save_transcript(
+                    transcript_path=self.outputJson,
+                    word_list=self.wordList,
+                    debug=self.debug
+                )
 
         return self.wordList
 
@@ -860,6 +826,10 @@ class WhisperPlugger(Plugger):
         beepDropTransition=BEEP_DROPOUT_TRANSITION_DEFAULT,
         confidenceThreshold=CONFIDENCE_THRESHOLD_DEFAULT,
         force=False,
+        useChunking=False,
+        chunkingWorkDir=None,
+        parallelEncoding=False,
+        maxWorkers=None,
         dbug=False,
     ):
         # Handle remote URL - add http:// if no scheme provided
@@ -915,6 +885,10 @@ class WhisperPlugger(Plugger):
             beepDropTransition=beepDropTransition,
             confidenceThreshold=confidenceThreshold,
             force=force,
+            useChunking=useChunking,
+            chunkingWorkDir=chunkingWorkDir,
+            parallelEncoding=parallelEncoding,
+            maxWorkers=maxWorkers,
             dbug=dbug,
         )
 
@@ -944,8 +918,11 @@ class WhisperPlugger(Plugger):
             mmguero.eprint(json.dumps(self.wordList))
 
         if self.outputJson:
-            with open(self.outputJson, "w") as f:
-                f.write(json.dumps(self.wordList))
+            TranscriptManager.save_transcript(
+                transcript_path=self.outputJson,
+                word_list=self.wordList,
+                debug=self.debug
+            )
 
         return self.wordList
 
@@ -1286,6 +1263,44 @@ def RunMonkeyPlug():
         help="Process file despite existence of embedded tag",
     )
 
+    chunkingArgGroup = parser.add_argument_group('Chunking Options')
+    chunkingArgGroup.add_argument(
+        "--use-chunking",
+        dest="useChunking",
+        type=mmguero.str2bool,
+        nargs="?",
+        const=True,
+        default=False,
+        metavar="true|false",
+        help="Enable audio chunking for large files (>150MB)",
+    )
+    chunkingArgGroup.add_argument(
+        "--chunking-work-dir",
+        dest="chunkingWorkDir",
+        metavar="<string>",
+        type=str,
+        default=None,
+        help="Working directory for audio chunks (default: same as input file)",
+    )
+    chunkingArgGroup.add_argument(
+        "--parallel-encoding",
+        dest="parallelEncoding",
+        type=mmguero.str2bool,
+        nargs="?",
+        const=True,
+        default=False,
+        metavar="true|false",
+        help="Enable parallel encoding after serial transcription (requires --use-chunking)",
+    )
+    chunkingArgGroup.add_argument(
+        "--max-workers",
+        dest="maxWorkers",
+        metavar="<int>",
+        type=int,
+        default=None,
+        help="Maximum number of parallel workers for encoding (default: CPU count, only with --parallel-encoding)",
+    )
+
     voskArgGroup = parser.add_argument_group('VOSK Options')
     voskArgGroup.add_argument(
         "--vosk-model-dir",
@@ -1396,6 +1411,10 @@ def RunMonkeyPlug():
             beepDropTransition=args.beepDropTransition,
             confidenceThreshold=args.confidenceThreshold,
             force=args.forceDespiteTag,
+            useChunking=args.useChunking,
+            chunkingWorkDir=args.chunkingWorkDir,
+            parallelEncoding=args.parallelEncoding,
+            maxWorkers=args.maxWorkers,
             dbug=args.debug,
         )
 
@@ -1438,6 +1457,10 @@ def RunMonkeyPlug():
             beepDropTransition=args.beepDropTransition,
             confidenceThreshold=args.confidenceThreshold,
             force=args.forceDespiteTag,
+            useChunking=args.useChunking,
+            chunkingWorkDir=args.chunkingWorkDir,
+            parallelEncoding=args.parallelEncoding,
+            maxWorkers=args.maxWorkers,
             dbug=args.debug,
         )
     

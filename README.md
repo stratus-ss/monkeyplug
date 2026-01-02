@@ -101,6 +101,15 @@ options:
                         Dropout transition for beep (default: 0)
   --force [true|false]  Process file despite existence of embedded tag
 
+Chunking Options:
+  --use-chunking [true|false]
+                        Enable audio chunking for large files (>150MB)
+  --chunking-work-dir <string>
+                        Working directory for audio chunks (default: same as input file)
+  --parallel-encoding [true|false]
+                        Enable parallel encoding after serial transcription (requires --use-chunking)
+  --max-workers <int>   Maximum number of parallel workers for encoding (default: CPU count, only with --parallel-encoding)
+
 VOSK Options:
   --vosk-model-dir <string>
                         VOSK model directory (default: ~/.cache/vosk)
@@ -185,6 +194,19 @@ monkeyplug.py -i input.mp3 -o output.mp3 --input-transcript my_transcript.json
 ```
 
 **Note**: When loading a transcript, the words are re-evaluated against your current swear list and confidence threshold settings, so you can experiment with different filtering options without re-transcribing the audio.
+
+### Large File Handling
+
+Monkeyplug automatically handles large audio files (>150MB) using intelligent chunking:
+
+- **Smart Splitting**: Automatically splits files at natural silence points rather than arbitrary timestamps
+- **Metadata Preservation**: Extracts and restores chapter markers and other metadata
+- **Chunk Reuse**: Caches split chunks and transcripts to avoid redundant processing during reruns
+- **Processing Modes**:
+  - **Serial** (default): Processes one chunk at a time (lower memory, slower)
+  - **Parallel**: Transcribes serially, then encodes chunks in parallel (faster, higher memory)
+
+The chunking system operates transparently—if your file exceeds 150MB, monkeyplug will automatically split, process, and reassemble it while preserving all metadata.
 
 ### Docker
 
