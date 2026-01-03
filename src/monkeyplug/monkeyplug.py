@@ -29,6 +29,7 @@ from monkeyplug.utilities import (
     AudioFilterBuilder,
     FFmpegRunner,
     TranscriptManager,
+    CensorshipReport,
     get_codecs as get_codecs_util
 )
 
@@ -190,6 +191,7 @@ class Plugger(object):
     outputAudioFileFormat = ""
     outputVideoFileFormat = ""
     outputJson = ""
+    reportFormat = "json"
     tmpDownloadedFileSpec = ""
     swearsFileSpec = ""
     swearsMap = {}
@@ -220,6 +222,7 @@ class Plugger(object):
         oAudioFileFormat,
         iSwearsFileSpec,
         outputJson,
+        reportFormat="txt",
         inputTranscript=None,
         saveTranscript=False,
         aParams=None,
@@ -253,6 +256,7 @@ class Plugger(object):
         self.forceDespiteTag = force
         self.debug = dbug
         self.outputJson = outputJson
+        self.reportFormat = reportFormat
         self.inputTranscript = inputTranscript
         self.saveTranscript = saveTranscript
         self.useChunking = useChunking
@@ -471,7 +475,10 @@ class Plugger(object):
         Returns:
             bool: True if word should be scrubbed, False otherwise
         """
-        return (scrubword(word_text) in self.swearsMap and 
+        scrubbed = scrubword(word_text)
+        # Don't censor empty strings (e.g., punctuation-only words like "%", "!", etc.)
+        return (scrubbed and 
+                scrubbed in self.swearsMap and 
                 confidence >= self.confidenceThreshold)
 
     ######## LoadTranscriptFromFile ##############################################
@@ -566,6 +573,10 @@ class Plugger(object):
                         output_file=self.outputFileSpec
                     )
                     SetMonkeyplugTag(self.outputFileSpec, debug=self.debug)
+                    
+                    # Generate censorship report for chunked processing
+                    self._generate_censorship_report()
+                    
                     return self.outputFileSpec
             
             # Normal (non-chunked) processing
@@ -599,17 +610,33 @@ class Plugger(object):
             )
 
             SetMonkeyplugTag(self.outputFileSpec, debug=self.debug)
+            
+            # Generate censorship report
+            self._generate_censorship_report()
 
         else:
             shutil.copyfile(self.inputFileSpec, self.outputFileSpec)
 
         return self.outputFileSpec
+    
+    ######## _generate_censorship_report #########################################
+    def _generate_censorship_report(self):
+        """Generate and display censorship report when in verbose mode."""
+        if not self.wordList or not self.debug:
+            return
+        
+        # Always print summary to CLI when verbose
+        CensorshipReport.print_summary(self.wordList)
+        
+        # Auto-generate report file based on output file
+        output_base = os.path.splitext(self.outputFileSpec)[0]
+        report_path = f"{output_base}_censorship_report.{self.reportFormat}"
+        
+        # Save report in specified format
+        CensorshipReport.generate_report(self.wordList, report_path, format=self.reportFormat)
 
 
-#################################################################################
 
-
-#################################################################################
 class VoskPlugger(Plugger):
     tmpWavFileSpec = ""
     modelPath = ""
@@ -624,6 +651,7 @@ class VoskPlugger(Plugger):
         iSwearsFileSpec,
         mDir,
         outputJson,
+        reportFormat="txt",
         inputTranscript=None,
         saveTranscript=False,
         aParams=None,
@@ -674,6 +702,7 @@ class VoskPlugger(Plugger):
             oAudioFileFormat=oAudioFileFormat,
             iSwearsFileSpec=iSwearsFileSpec,
             outputJson=outputJson,
+            reportFormat=reportFormat,
             inputTranscript=inputTranscript,
             saveTranscript=saveTranscript,
             aParams=aParams,
@@ -808,6 +837,7 @@ class WhisperPlugger(Plugger):
         mName,
         torchThreads,
         outputJson,
+        reportFormat="txt",
         inputTranscript=None,
         saveTranscript=False,
         remoteUrl=None,
@@ -870,6 +900,7 @@ class WhisperPlugger(Plugger):
             oAudioFileFormat=oAudioFileFormat,
             iSwearsFileSpec=iSwearsFileSpec,
             outputJson=outputJson,
+            reportFormat=reportFormat,
             inputTranscript=inputTranscript,
             saveTranscript=saveTranscript,
             aParams=aParams,
@@ -1122,6 +1153,14 @@ def RunMonkeyPlug():
         action="store_true",
         default=False,
         help="Automatically save transcript JSON alongside output audio file (default: true)",
+    )
+    parser.add_argument(
+        "--report-format",
+        dest="reportFormat",
+        type=str,
+        default="json",
+        choices=["txt", "json"],
+        help="Format for auto-generated censorship report when using --verbose (default: json)",
     )
     parser.add_argument(
         "-w",
@@ -1395,6 +1434,7 @@ def RunMonkeyPlug():
             args.swears,
             args.voskModelDir,
             args.outputJson,
+            reportFormat=args.reportFormat,
             inputTranscript=args.inputTranscript,
             saveTranscript=args.saveTranscript,
             aParams=args.aParams,
@@ -1439,6 +1479,7 @@ def RunMonkeyPlug():
             args.whisperModelName,
             args.torchThreads,
             args.outputJson,
+            reportFormat=args.reportFormat,
             inputTranscript=args.inputTranscript,
             saveTranscript=args.saveTranscript,
             remoteUrl=remote_url,

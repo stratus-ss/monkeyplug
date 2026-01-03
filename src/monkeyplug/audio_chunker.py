@@ -156,9 +156,45 @@ class AudioChunker:
 
             overall_duration = (datetime.datetime.now() - overall_start).total_seconds()
             self._log_section(f"Chunked processing complete - Total time: {overall_duration:.1f}s ({overall_duration/60:.1f} minutes)")
+            
+            # Aggregate all chunk transcripts into plugger's wordList for reporting
+            self._aggregate_transcripts(chunks)
 
         except Exception as e:
             raise AudioChunkingError(f"Chunking failed: {e}") from e
+    
+    def _aggregate_transcripts(self, chunks: list):
+        """
+        Load and aggregate all chunk transcripts into the plugger's wordList.
+        This enables censorship report generation after chunked processing.
+        """
+        self._log("Aggregating transcripts from all chunks...")
+        self.plugger.wordList = []
+        
+        for chunk_file in chunks:
+            transcript_path = TranscriptManager.get_transcript_path(chunk_file)
+            if os.path.exists(transcript_path):
+                try:
+                    with open(transcript_path, 'r') as f:
+                        chunk_words = json.load(f)
+                        self.plugger.wordList.extend(chunk_words)
+                except Exception as e:
+                    self._log(f"Warning: Could not load transcript {transcript_path}: {e}")
+        
+        # Recalculate scrub flags for aggregated list
+        for word in self.plugger.wordList:
+            word_text = word.get('word', '')
+            word_conf = word.get('conf', 1.0)
+            import string
+            scrubbed = str(word_text).lower().strip().translate(
+                str.maketrans('', '', string.punctuation)
+            )
+            # Don't censor empty strings (e.g., punctuation-only words like "%", "!", etc.)
+            word['scrub'] = (scrubbed and 
+                           scrubbed in self.plugger.swearsMap and 
+                           word_conf >= self.plugger.confidenceThreshold)
+        
+        self._log(f"Aggregated {len(self.plugger.wordList)} words from {len(chunks)} chunks")
 
     def _process_chunks_serial(self, chunks: list) -> list:
         """

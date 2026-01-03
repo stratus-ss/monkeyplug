@@ -187,6 +187,163 @@ class FFmpegRunner:
         return silence_points
 
 
+class CensorshipReport:
+    """Generates reports of censored words and silence insertions."""
+    
+    @staticmethod
+    def generate_report(word_list: list, output_path: str, format: str = 'json'):
+        """
+        Generate a censorship report showing all words being censored.
+        
+        Args:
+            word_list: List of word dictionaries with 'scrub' flags
+            output_path: Path to save the report
+            format: Report format ('txt' or 'json', default: 'json')
+        """
+        censored_words = [w for w in word_list if w.get('scrub', False)]
+        
+        if format == 'txt':
+            CensorshipReport._generate_text_report(censored_words, output_path)
+        elif format == 'json':
+            CensorshipReport._generate_json_report(censored_words, output_path)
+        else:
+            raise ValueError(f"Unsupported format: {format}. Use 'txt' or 'json'")
+    
+    @staticmethod
+    def _generate_text_report(censored_words: list, output_path: str):
+        """Generate plain text censorship report."""
+        with open(output_path, 'w') as f:
+            f.write("=" * 80 + "\n")
+            f.write("MONKEYPLUG CENSORSHIP REPORT\n")
+            f.write("=" * 80 + "\n\n")
+            
+            if not censored_words:
+                f.write("No words were censored.\n")
+                return
+            
+            f.write(f"Total words censored: {len(censored_words)}\n\n")
+            f.write("-" * 80 + "\n")
+            f.write(f"{'#':<6} {'Word':<20} {'Start Time':<12} {'End Time':<12} {'Confidence':<12}\n")
+            f.write("-" * 80 + "\n")
+            
+            for idx, word in enumerate(censored_words, 1):
+                word_text = word.get('word', 'N/A')
+                start = word.get('start', 0)
+                end = word.get('end', 0)
+                conf = word.get('conf', 1.0)
+                
+                f.write(f"{idx:<6} {word_text:<20} {start:<12.2f} {end:<12.2f} {conf:<12.3f}\n")
+            
+            f.write("-" * 80 + "\n\n")
+            
+            # Summary statistics
+            f.write("SUMMARY\n")
+            f.write("-" * 80 + "\n")
+            f.write(f"Total censored words: {len(censored_words)}\n")
+            
+            if censored_words:
+                total_duration = sum(w.get('end', 0) - w.get('start', 0) for w in censored_words)
+                f.write(f"Total silence duration: {total_duration:.2f} seconds\n")
+                
+                first_censor = min(w.get('start', 0) for w in censored_words)
+                last_censor = max(w.get('end', 0) for w in censored_words)
+                f.write(f"First censorship at: {first_censor:.2f}s\n")
+                f.write(f"Last censorship at: {last_censor:.2f}s\n")
+                
+                # Word frequency
+                from collections import Counter
+                word_counts = Counter(w.get('word', 'N/A') for w in censored_words)
+                f.write("\nMost censored words:\n")
+                for word, count in word_counts.most_common(10):
+                    f.write(f"  {word}: {count} occurrence(s)\n")
+    
+    @staticmethod
+    def _generate_json_report(censored_words: list, output_path: str):
+        """Generate JSON censorship report."""
+        report = {
+            'total_censored': len(censored_words),
+            'censored_words': censored_words
+        }
+        
+        if censored_words:
+            report['summary'] = {
+                'total_silence_duration': sum(w.get('end', 0) - w.get('start', 0) for w in censored_words),
+                'first_censorship_time': min(w.get('start', 0) for w in censored_words),
+                'last_censorship_time': max(w.get('end', 0) for w in censored_words)
+            }
+            
+            # Word frequency
+            from collections import Counter
+            word_counts = Counter(w.get('word', 'N/A') for w in censored_words)
+            report['word_frequency'] = dict(word_counts)
+        
+        with open(output_path, 'w') as f:
+            json.dump(report, f, indent=2)
+    
+    @staticmethod
+    def print_summary(word_list: list):
+        """
+        Print censorship summary to CLI.
+        
+        Args:
+            word_list: List of word dictionaries with 'scrub' flags
+        """
+        censored_words = [w for w in word_list if w.get('scrub', False)]
+        
+        if not censored_words:
+            mmguero.eprint("\nNo words were censored.")
+            return
+        
+        from collections import Counter
+        
+        total_duration = sum(w.get('end', 0) - w.get('start', 0) for w in censored_words)
+        word_counts = Counter(w.get('word', 'N/A') for w in censored_words)
+        
+        mmguero.eprint("\n" + "=" * 70)
+        mmguero.eprint("CENSORSHIP SUMMARY")
+        mmguero.eprint("=" * 70)
+        mmguero.eprint(f"Total words censored: {len(censored_words)}")
+        mmguero.eprint(f"Total silence duration: {total_duration:.2f} seconds")
+        mmguero.eprint(f"\nMost censored words:")
+        for word, count in word_counts.most_common(10):
+            mmguero.eprint(f"  - {word}: {count} occurrence(s)")
+        mmguero.eprint("=" * 70 + "\n")
+    
+    @staticmethod
+    def save_json_report(word_list: list, output_path: str):
+        """
+        Save detailed censorship report as pretty-printed JSON.
+        
+        Args:
+            word_list: List of word dictionaries with 'scrub' flags
+            output_path: Path to save JSON report
+        """
+        from collections import Counter
+        
+        censored_words = [w for w in word_list if w.get('scrub', False)]
+        
+        report = {
+            'total_censored': len(censored_words),
+            'censored_words': censored_words
+        }
+        
+        if censored_words:
+            report['summary'] = {
+                'total_silence_duration': sum(w.get('end', 0) - w.get('start', 0) for w in censored_words),
+                'first_censorship_time': min(w.get('start', 0) for w in censored_words),
+                'last_censorship_time': max(w.get('end', 0) for w in censored_words)
+            }
+            
+            # Word frequency
+            word_counts = Counter(w.get('word', 'N/A') for w in censored_words)
+            report['word_frequency'] = dict(word_counts)
+        
+        with open(output_path, 'w') as f:
+            json.dump(report, f, indent=2)
+        
+        mmguero.eprint(f"Censorship report saved: {output_path}")
+
+
 class TranscriptManager:
     """Manages transcript file operations for speech recognition results."""
     
