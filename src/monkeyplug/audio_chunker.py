@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Optional
 
 from monkeyplug.utilities import (
+    MonkeyplugLogger,
     FFmpegCommandBuilder,
     AudioFilterBuilder,
     FFmpegRunner,
@@ -75,19 +76,26 @@ class AudioChunker:
         self.parallel_encoding = parallel_encoding
         self.max_workers = max_workers
         self.debug = plugger.debug
-
-    def _log(self, message: str):
-        """Log a message with timestamp if debug is enabled."""
-        if self.debug:
-            timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            mmguero.eprint(f"[{timestamp}] [AudioChunker] {message}")
-
-    def _log_section(self, title: str):
-        """Log a section header with separator lines."""
-        separator = "=" * 60
-        self._log(separator)
-        self._log(title)
-        self._log(separator)
+        
+        # Reuse plugger's logger but with [AudioChunker] prefix
+        # This ensures all logs go to the same file
+        if hasattr(plugger, 'logger') and plugger.logger:
+            # Create a wrapper logger that adds the AudioChunker prefix
+            self.logger = MonkeyplugLogger(
+                output_file_path=None,  # Don't create a new log file
+                enabled=self.debug,
+                prefix="[AudioChunker]"
+            )
+            # Share the underlying Python logger instance
+            self.logger.logger = plugger.logger.logger
+            self.logger.log_file = plugger.logger.log_file
+        else:
+            # Fallback if plugger doesn't have a logger
+            self.logger = MonkeyplugLogger(
+                output_file_path=getattr(plugger, 'outputFileSpec', None),
+                enabled=self.debug,
+                prefix="[AudioChunker]"
+            )
 
     @contextmanager
     def _plugger_temp_state(self):
@@ -127,20 +135,20 @@ class AudioChunker:
         """
         try:
             overall_start = datetime.datetime.now()
-            self._log_section("Starting chunked processing")
+            self.logger.log_section("Starting chunked processing")
 
             # Extract chapters before splitting
             step_start = datetime.datetime.now()
             file_id = os.path.splitext(os.path.basename(source_file))[0]
             chapter_file = self._extract_chapters(source_file, file_id)
             step_duration = (datetime.datetime.now() - step_start).total_seconds()
-            self._log(f"Chapter extraction completed in {step_duration:.1f}s")
+            self.logger.info(f"Chapter extraction completed in {step_duration:.1f}s")
 
             # Split at silence points
             step_start = datetime.datetime.now()
             chunks = self._split_audio_at_silence(source_file, file_id)
             step_duration = (datetime.datetime.now() - step_start).total_seconds()
-            self._log(f"Audio splitting completed in {step_duration:.1f}s")
+            self.logger.info(f"Audio splitting completed in {step_duration:.1f}s")
 
             # Process chunks (serial or parallel based on configuration)
             if self.parallel_encoding:
@@ -152,10 +160,10 @@ class AudioChunker:
             step_start = datetime.datetime.now()
             self._concatenate_chunks(processed_chunks, output_file, file_id, chapter_file)
             step_duration = (datetime.datetime.now() - step_start).total_seconds()
-            self._log(f"Concatenation completed in {step_duration:.1f}s")
+            self.logger.info(f"Concatenation completed in {step_duration:.1f}s")
 
             overall_duration = (datetime.datetime.now() - overall_start).total_seconds()
-            self._log_section(f"Chunked processing complete - Total time: {overall_duration:.1f}s ({overall_duration/60:.1f} minutes)")
+            self.logger.log_section(f"Chunked processing complete - Total time: {overall_duration:.1f}s ({overall_duration/60:.1f} minutes)")
             
             # Aggregate all chunk transcripts into plugger's wordList for reporting
             self._aggregate_transcripts(chunks)
@@ -168,7 +176,7 @@ class AudioChunker:
         Load and aggregate all chunk transcripts into the plugger's wordList.
         This enables censorship report generation after chunked processing.
         """
-        self._log("Aggregating transcripts from all chunks...")
+        self.logger.info("Aggregating transcripts from all chunks...")
         self.plugger.wordList = []
         
         for chunk_file in chunks:
@@ -179,7 +187,7 @@ class AudioChunker:
                         chunk_words = json.load(f)
                         self.plugger.wordList.extend(chunk_words)
                 except Exception as e:
-                    self._log(f"Warning: Could not load transcript {transcript_path}: {e}")
+                    self.logger.info(f"Warning: Could not load transcript {transcript_path}: {e}")
         
         # Recalculate scrub flags for aggregated list
         for word in self.plugger.wordList:
@@ -194,7 +202,7 @@ class AudioChunker:
                            scrubbed in self.plugger.swearsMap and 
                            word_conf >= self.plugger.confidenceThreshold)
         
-        self._log(f"Aggregated {len(self.plugger.wordList)} words from {len(chunks)} chunks")
+        self.logger.info(f"Aggregated {len(self.plugger.wordList)} words from {len(chunks)} chunks")
 
     def _process_chunks_serial(self, chunks: list) -> list:
         """
@@ -202,24 +210,24 @@ class AudioChunker:
         """
         cpu_count = os.cpu_count() or 1
         serial_start = datetime.datetime.now()
-        self._log(f"Processing {len(chunks)} chunks serially (detected {cpu_count} CPUs, using 1 worker)...")
+        self.logger.info(f"Processing {len(chunks)} chunks serially (detected {cpu_count} CPUs, using 1 worker)...")
         
         processed_chunks = []
         for i, chunk_file in enumerate(chunks, 1):
             chunk_start = datetime.datetime.now()
-            self._log(f"Processing chunk {i}/{len(chunks)}")
+            self.logger.info(f"Processing chunk {i}/{len(chunks)}")
             try:
                 processed_chunk = self._process_chunk(chunk_file, i)
                 processed_chunks.append(processed_chunk)
                 chunk_duration = (datetime.datetime.now() - chunk_start).total_seconds()
-                self._log(f"Chunk {i} completed in {chunk_duration:.1f}s")
+                self.logger.info(f"Chunk {i} completed in {chunk_duration:.1f}s")
             except Exception as e:
-                self._log(f"ERROR: Failed to process chunk {i}: {e}")
-                self._log(f"WARNING: Using original chunk {i}")
+                self.logger.info(f"ERROR: Failed to process chunk {i}: {e}")
+                self.logger.info(f"WARNING: Using original chunk {i}")
                 processed_chunks.append(chunk_file)
         
         serial_duration = (datetime.datetime.now() - serial_start).total_seconds()
-        self._log(f"Serial processing complete - {len(processed_chunks)} chunks in {serial_duration:.1f}s")
+        self.logger.info(f"Serial processing complete - {len(processed_chunks)} chunks in {serial_duration:.1f}s")
         return processed_chunks
 
     def _process_chunks_parallel(self, chunks: list) -> list:
@@ -238,31 +246,31 @@ class AudioChunker:
     
     def _transcribe_all_chunks(self, chunks: list) -> list:
         """Transcribe all chunks serially and return transcript paths."""
-        self._log_section("PHASE 1: Serial Transcription")
+        self.logger.log_section("PHASE 1: Serial Transcription")
         start_time = datetime.datetime.now()
         
         transcripts = []
         for i, chunk_file in enumerate(chunks, 1):
-            self._log(f"Transcribing chunk {i}/{len(chunks)}")
+            self.logger.info(f"Transcribing chunk {i}/{len(chunks)}")
             transcript_path = self._transcribe_chunk(chunk_file, i)
             transcripts.append(transcript_path)
         
         duration = (datetime.datetime.now() - start_time).total_seconds()
-        self._log(f"Transcription complete - {len(transcripts)} transcripts in {duration:.1f}s")
+        self.logger.info(f"Transcription complete - {len(transcripts)} transcripts in {duration:.1f}s")
         return transcripts
     
     def _encode_all_chunks_parallel(self, chunks: list, transcripts: list) -> list:
         """Encode all chunks in parallel using up to half of available CPUs."""
-        self._log_section("PHASE 2: Parallel Encoding")
+        self.logger.log_section("PHASE 2: Parallel Encoding")
         start_time = datetime.datetime.now()
         
         # Determine worker count
         if self.max_workers is None:
             cpu_count = os.cpu_count() or 1
             self.max_workers = max(1, cpu_count // 2)
-            self._log(f"Detected {cpu_count} CPUs, using {self.max_workers} workers")
+            self.logger.info(f"Detected {cpu_count} CPUs, using {self.max_workers} workers")
         
-        self._log(f"Encoding {len(chunks)} chunks using {self.max_workers} parallel workers...")
+        self.logger.info(f"Encoding {len(chunks)} chunks using {self.max_workers} parallel workers...")
         
         # Launch parallel encoding tasks
         processed_chunks = [None] * len(chunks)
@@ -282,14 +290,14 @@ class AudioChunker:
                 completed_count += 1
                 try:
                     processed_chunks[chunk_idx] = future.result()
-                    self._log(f"Encoded chunk {chunk_idx+1} ({completed_count}/{len(chunks)})")
+                    self.logger.info(f"Encoded chunk {chunk_idx+1} ({completed_count}/{len(chunks)})")
                 except Exception as e:
-                    self._log(f"ERROR encoding chunk {chunk_idx+1}: {e}")
-                    self._log(f"Using original chunk {chunk_idx+1}")
+                    self.logger.info(f"ERROR encoding chunk {chunk_idx+1}: {e}")
+                    self.logger.info(f"Using original chunk {chunk_idx+1}")
                     processed_chunks[chunk_idx] = chunks[chunk_idx]
         
         duration = (datetime.datetime.now() - start_time).total_seconds()
-        self._log(f"Encoding complete - {len(chunks)} chunks in {duration:.1f}s")
+        self.logger.info(f"Encoding complete - {len(chunks)} chunks in {duration:.1f}s")
         return processed_chunks
 
     def _process_chunk(self, chunk_file: str, chunk_index: int) -> str:
@@ -310,7 +318,7 @@ class AudioChunker:
             
             # Load existing transcript or create new one
             if os.path.exists(transcript_path):
-                self._log(f"Reusing existing transcript for chunk {chunk_index}")
+                self.logger.info(f"Reusing existing transcript for chunk {chunk_index}")
                 self.plugger.inputTranscript = transcript_path
             
             # CreateCleanMuteList will either load the transcript (if inputTranscript is set)
@@ -323,7 +331,7 @@ class AudioChunker:
                     transcript_path=transcript_path,
                     word_list=self.plugger.wordList,
                     debug=self.debug,
-                    logger=self._log
+                    logger=self.logger.info
                 )
             
             # Encode chunk
@@ -361,7 +369,7 @@ class AudioChunker:
                 swears_map=self.plugger.swearsMap,
                 confidence_threshold=self.plugger.confidenceThreshold,
                 debug=self.debug,
-                logger=self._log
+                logger=self.logger.info
             )
             self.plugger.wordList = word_list
             
@@ -452,7 +460,7 @@ class AudioChunker:
         ])
         
         if existing_chunks:
-            self._log(f"Reusing {len(existing_chunks)} existing chunks")
+            self.logger.info(f"Reusing {len(existing_chunks)} existing chunks")
             return existing_chunks
         
         # Calculate target duration
@@ -461,15 +469,17 @@ class AudioChunker:
         duration = self._get_audio_duration(source_file)
         target_duration = duration / num_chunks
         
-        self._log(f"Splitting {file_size / (1024*1024):.1f} MB file into ~{num_chunks} chunks")
-        self._log(f"Total duration: {duration:.1f}s, Target chunk: {target_duration:.1f}s")
+        self.logger.info(f"Source file: {source_file}")
+        self.logger.info(f"File size on disk: {file_size / (1024*1024):.1f} MB ({file_size} bytes)")
+        self.logger.info(f"Splitting into ~{num_chunks} chunks of ~{self.MAX_CHUNK_SIZE_MB} MB each")
+        self.logger.info(f"Total duration: {duration:.1f}s, Target chunk: {target_duration:.1f}s")
         
         # Detect silence and split
         silence_points = self._detect_silence_points(source_file)
         split_times = self._select_split_points(silence_points, duration, target_duration)
         
         if not split_times:
-            self._log("WARNING: No split points found, file may be too short")
+            self.logger.info("WARNING: No split points found, file may be too short")
             return [source_file]
         
         # Perform split using utilities module
@@ -486,10 +496,10 @@ class AudioChunker:
         chunk_paths = [str(chunk) for chunk in chunks]
         
         if not chunk_paths:
-            self._log("WARNING: No chunks created, using original")
+            self.logger.info("WARNING: No chunks created, using original")
             return [source_file]
         
-        self._log(f"Created {len(chunk_paths)} chunks")
+        self.logger.info(f"Created {len(chunk_paths)} chunks")
         return chunk_paths
 
     def _get_audio_duration(self, source_file: str) -> float:
@@ -503,7 +513,7 @@ class AudioChunker:
             self.SILENCE_NOISE_THRESHOLD,
             self.SILENCE_MIN_DURATION
         )
-        self._log(f"Found {len(silence_points)} silence points")
+        self.logger.info(f"Found {len(silence_points)} silence points")
         return silence_points
 
     def _select_split_points(self, silence_points: list, duration: float, target_duration: float) -> list:
@@ -541,15 +551,15 @@ class AudioChunker:
         
         try:
             subprocess.run(extract_cmd, check=True, capture_output=True)
-            self._log(f"Extracted chapters to {metadata_file}")
+            self.logger.info(f"Extracted chapters to {metadata_file}")
             return metadata_file
         except subprocess.CalledProcessError:
-            self._log("WARNING: Chapter extraction failed")
+            self.logger.info("WARNING: Chapter extraction failed")
             return None
 
     def _concatenate_chunks(self, chunk_files: list, output_file: str, file_id: str, chapter_file: Optional[Path]):
         """Concatenate audio chunks into final output."""
-        self._log(f"Concatenating {len(chunk_files)} chunks...")
+        self.logger.info(f"Concatenating {len(chunk_files)} chunks...")
         
         # Verify all chunk files exist
         missing_chunks = [f for f in chunk_files if not os.path.exists(f)]
@@ -566,9 +576,9 @@ class AudioChunker:
                 f.write(f"file '{abs_path}'\n")
         
         if self.debug:
-            self._log(f"Concat list saved to: {concat_list_file}")
+            self.logger.info(f"Concat list saved to: {concat_list_file}")
             with open(concat_list_file, 'r') as f:
-                self._log(f"Concat list contents:\n{f.read()}")
+                self.logger.info(f"Concat list contents:\n{f.read()}")
         
         # Concatenate using utilities module
         cmd_result = FFmpegCommandBuilder.build_concat_command(
@@ -584,7 +594,7 @@ class AudioChunker:
             try:
                 result = subprocess.run(concat_cmd, capture_output=True, text=True)
                 if result.returncode != 0:
-                    self._log(f"FFmpeg concat error: {result.stderr}")
+                    self.logger.info(f"FFmpeg concat error: {result.stderr}")
                     raise subprocess.CalledProcessError(result.returncode, concat_cmd, result.stdout, result.stderr)
             except subprocess.CalledProcessError as e:
                 raise AudioChunkingError(
@@ -597,7 +607,7 @@ class AudioChunker:
             try:
                 result = subprocess.run(restore_cmd, capture_output=True, text=True)
                 if result.returncode != 0:
-                    self._log(f"FFmpeg chapter restore error: {result.stderr}")
+                    self.logger.info(f"FFmpeg chapter restore error: {result.stderr}")
                     raise subprocess.CalledProcessError(result.returncode, restore_cmd, result.stdout, result.stderr)
             except subprocess.CalledProcessError as e:
                 raise AudioChunkingError(
@@ -613,7 +623,7 @@ class AudioChunker:
             try:
                 result = subprocess.run(concat_cmd, capture_output=True, text=True)
                 if result.returncode != 0:
-                    self._log(f"FFmpeg concat error: {result.stderr}")
+                    self.logger.info(f"FFmpeg concat error: {result.stderr}")
                     raise subprocess.CalledProcessError(result.returncode, concat_cmd, result.stdout, result.stderr)
             except subprocess.CalledProcessError as e:
                 raise AudioChunkingError(
@@ -623,7 +633,7 @@ class AudioChunker:
                 ) from e
         
         output_size_mb = os.path.getsize(output_file) / (1024 * 1024)
-        self._log(f"Concatenation complete - Final output: {output_size_mb:.1f} MB")
+        self.logger.info(f"Concatenation complete - Final output: {output_size_mb:.1f} MB")
         
         # Clean up processed chunk files (keep original chunks for potential reuse)
         self._cleanup_processed_chunks(chunk_files)
@@ -642,7 +652,7 @@ class AudioChunker:
                     os.remove(chunk_file)
                     cleaned_count += 1
                 except Exception as e:
-                    self._log(f"WARNING: Could not delete {chunk_file}: {e}")
+                    self.logger.info(f"WARNING: Could not delete {chunk_file}: {e}")
         
         if cleaned_count > 0:
-            self._log(f"Cleaned up {cleaned_count} processed chunk files")
+            self.logger.info(f"Cleaned up {cleaned_count} processed chunk files")

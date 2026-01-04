@@ -25,6 +25,7 @@ except ImportError:
     AudioChunker = None
 
 from monkeyplug.utilities import (
+    MonkeyplugLogger,
     FFmpegCommandBuilder,
     AudioFilterBuilder,
     FFmpegRunner,
@@ -39,6 +40,7 @@ SAMPLE_RATE_REPLACER = 'SAMPLE'
 AUDIO_DEFAULT_PARAMS_BY_FORMAT = {
     "flac": ["-c:a", "flac", "-ar", SAMPLE_RATE_REPLACER, "-ac", CHANNELS_REPLACER],
     "m4a": ["-c:a", "aac", "-b:a", "128K", "-ar", SAMPLE_RATE_REPLACER, "-ac", CHANNELS_REPLACER],
+    "m4b": ["-c:a", "aac", "-b:a", "128K", "-ar", SAMPLE_RATE_REPLACER, "-ac", CHANNELS_REPLACER],
     "aac": ["-c:a", "aac", "-b:a", "128K", "-ar", SAMPLE_RATE_REPLACER, "-ac", CHANNELS_REPLACER],
     "mp3": ["-c:a", "libmp3lame", "-b:a", "128K", "-ar", SAMPLE_RATE_REPLACER, "-ac", CHANNELS_REPLACER],
     "ogg": ["-c:a", "libvorbis", "-qscale:a", "5", "-ar", SAMPLE_RATE_REPLACER, "-ac", CHANNELS_REPLACER],
@@ -242,7 +244,7 @@ class Plugger(object):
         chunkingWorkDir=None,
         parallelEncoding=False,
         maxWorkers=None,
-        dbug=False,
+        verbose=False,
     ):
         self.padSecPre = padMsecPre / 1000.0
         self.padSecPost = padMsecPost / 1000.0
@@ -254,7 +256,7 @@ class Plugger(object):
         self.beepDropTransition = beepDropTransition
         self.confidenceThreshold = confidenceThreshold
         self.forceDespiteTag = force
-        self.debug = dbug
+        self.debug = verbose
         self.outputJson = outputJson
         self.reportFormat = reportFormat
         self.inputTranscript = inputTranscript
@@ -351,6 +353,14 @@ class Plugger(object):
         if self.outputVideoFileFormat:
             self.outputFileSpec = outParts[0] + self.outputVideoFileFormat
 
+        # Setup logger BEFORE any operations that might use it
+        self.logger = MonkeyplugLogger(
+            output_file_path=self.outputFileSpec,
+            enabled=self.debug,
+            prefix=None  # No prefix for main plugger logs
+        )
+        self.logFile = self.logger.log_file
+
         # create output directory if it doesn't exist
         self._ensure_directory_exists(self.outputFileSpec, "output directory")
 
@@ -380,23 +390,23 @@ class Plugger(object):
         self._load_swears_file()
 
         if self.debug:
-            mmguero.eprint(f'Input: {self.inputFileSpec}')
-            mmguero.eprint(f'Input codec: {self.inputCodecs}')
-            mmguero.eprint(f'Output: {self.outputFileSpec}')
-            mmguero.eprint(f'Output audio format: {self.outputAudioFileFormat}')
-            mmguero.eprint(f'Encode parameters: {self.aParams}')
-            mmguero.eprint(f'Profanity file: {self.swearsFileSpec}')
-            mmguero.eprint(f'Intermediate downloaded file: {self.tmpDownloadedFileSpec}')
+            self.logger.info(f'Input: {self.inputFileSpec}')
+            self.logger.info(f'Input codec: {self.inputCodecs}')
+            self.logger.info(f'Output: {self.outputFileSpec}')
+            self.logger.info(f'Output audio format: {self.outputAudioFileFormat}')
+            self.logger.info(f'Encode parameters: {self.aParams}')
+            self.logger.info(f'Profanity file: {self.swearsFileSpec}')
+            self.logger.info(f'Intermediate downloaded file: {self.tmpDownloadedFileSpec}')
             if self.outputJson:
-                mmguero.eprint(f'Transcript output: {self.outputJson}')
-            mmguero.eprint(f'Beep instead of mute: {self.beep}')
+                self.logger.info(f'Transcript output: {self.outputJson}')
+            self.logger.info(f'Beep instead of mute: {self.beep}')
             if self.beep:
-                mmguero.eprint(f'Beep hertz: {self.beepHertz}')
-                mmguero.eprint(f'Beep mix normalization: {self.beepMixNormalize}')
-                mmguero.eprint(f'Beep audio weight: {self.beepAudioWeight}')
-                mmguero.eprint(f'Beep sine weight: {self.beepSineWeight}')
-                mmguero.eprint(f'Beep dropout transition: {self.beepDropTransition}')
-            mmguero.eprint(f'Force despite tags: {self.forceDespiteTag}')
+                self.logger.info(f'Beep hertz: {self.beepHertz}')
+                self.logger.info(f'Beep mix normalization: {self.beepMixNormalize}')
+                self.logger.info(f'Beep audio weight: {self.beepAudioWeight}')
+                self.logger.info(f'Beep sine weight: {self.beepSineWeight}')
+                self.logger.info(f'Beep dropout transition: {self.beepDropTransition}')
+            self.logger.info(f'Force despite tags: {self.forceDespiteTag}')
 
     ######## del ##################################################################
     def __del__(self):
@@ -410,9 +420,10 @@ class Plugger(object):
         directory = os.path.dirname(filepath)
         if directory and not os.path.exists(directory):
             if self.debug:
-                mmguero.eprint(f'Creating {description}: {directory}')
+                self.logger.info(f'Creating {description}: {directory}')
             os.makedirs(directory, exist_ok=True)
         return directory
+
 
     ######## _load_swears_file ####################################################
     def _load_swears_file(self):
@@ -437,7 +448,7 @@ class Plugger(object):
             self._load_swears_from_text()
         
         if self.debug:
-            mmguero.eprint(f'Loaded {len(self.swearsMap)} profanity entries from {self.swearsFileSpec}')
+            self.logger.info(f'Loaded {len(self.swearsMap)} profanity entries from {self.swearsFileSpec}')
     
     def _load_swears_from_json(self):
         """Load swears from JSON format - simple array of strings
@@ -520,6 +531,7 @@ class Plugger(object):
                 ]
             )
         if self.debug:
+            mmguero.eprint(f"Found {len(self.naughtyWordList)} words to censor:")
             mmguero.eprint(self.naughtyWordList)
 
         self.muteTimeList = []
@@ -547,10 +559,7 @@ class Plugger(object):
                 self.muteTimeList.append(fade_in)
 
         if self.debug:
-            mmguero.eprint(self.muteTimeList)
-            if self.beep:
-                mmguero.eprint(self.sineTimeList)
-                mmguero.eprint(self.beepDelayList)
+            mmguero.eprint(f"Created {len(self.muteTimeList)} filter entries")
 
         return self.muteTimeList
 
@@ -567,7 +576,7 @@ class Plugger(object):
                 )
                 if chunker.needs_chunking(self.inputFileSpec):
                     if self.debug:
-                        mmguero.eprint("File exceeds size threshold, using chunked processing")
+                        self.logger.info("File exceeds size threshold, using chunked processing")
                     chunker.process_with_chunking(
                         source_file=self.inputFileSpec,
                         output_file=self.outputFileSpec
@@ -672,7 +681,7 @@ class VoskPlugger(Plugger):
         chunkingWorkDir=None,
         parallelEncoding=False,
         maxWorkers=None,
-        dbug=False,
+        verbose=False,
     ):
         self.wavReadFramesChunk = wChunk
         self.modelPath = None
@@ -690,10 +699,10 @@ class VoskPlugger(Plugger):
                     mDir,
                 )
 
-            self.vosk = mmguero.dynamic_import("vosk", "vosk", debug=dbug)
+            self.vosk = mmguero.dynamic_import("vosk", "vosk", debug=verbose)
             if not self.vosk:
                 raise Exception(f"Unable to initialize VOSK API")
-            if not dbug:
+            if not verbose:
                 self.vosk.SetLogLevel(-1)
 
         super().__init__(
@@ -722,17 +731,17 @@ class VoskPlugger(Plugger):
             chunkingWorkDir=chunkingWorkDir,
             parallelEncoding=parallelEncoding,
             maxWorkers=maxWorkers,
-            dbug=dbug,
+            verbose=verbose,
         )
 
         self.tmpWavFileSpec = self.inputFileParts[0] + ".wav"
 
         if self.debug:
             if inputTranscript:
-                mmguero.eprint(f'Using input transcript (skipping speech recognition)')
+                self.logger.info(f'Using input transcript (skipping speech recognition)')
             else:
-                mmguero.eprint(f'Model directory: {self.modelPath}')
-                mmguero.eprint(f'Intermediate audio file: {self.tmpWavFileSpec}')
+                self.logger.info(f'Model directory: {self.modelPath}')
+                self.logger.info(f'Intermediate audio file: {self.tmpWavFileSpec}')
                 mmguero.eprint(f'Read frames: {self.wavReadFramesChunk}')
 
     def __del__(self):
@@ -801,7 +810,7 @@ class VoskPlugger(Plugger):
                 )
 
             if self.debug:
-                mmguero.eprint(json.dumps(self.wordList))
+                mmguero.eprint(f"Speech recognition complete: {len(self.wordList)} words transcribed")
 
             if self.outputJson:
                 TranscriptManager.save_transcript(
@@ -860,7 +869,7 @@ class WhisperPlugger(Plugger):
         chunkingWorkDir=None,
         parallelEncoding=False,
         maxWorkers=None,
-        dbug=False,
+        verbose=False,
     ):
         # Handle remote URL - add http:// if no scheme provided
         if remoteUrl:
@@ -868,7 +877,7 @@ class WhisperPlugger(Plugger):
             remoteUrl = remoteUrl.rstrip('/')
             if not remoteUrl.startswith(('http://', 'https://')):
                 remoteUrl = f'http://{remoteUrl}'
-                if dbug:
+                if verbose:
                     mmguero.eprint(f'Adding http:// to URL: {original_url} -> {remoteUrl}')
         self.remote_url = remoteUrl
         self.api_timeout = apiTimeout
@@ -882,11 +891,11 @@ class WhisperPlugger(Plugger):
             # Only load local model if not using remote
             if not self.remote_url:
                 if torchThreads > 0:
-                    self.torch = mmguero.dynamic_import("torch", "torch", debug=dbug)
+                    self.torch = mmguero.dynamic_import("torch", "torch", debug=verbose)
                     if self.torch:
                         self.torch.set_num_threads(torchThreads)
 
-                self.whisper = mmguero.dynamic_import("whisper", "openai-whisper", debug=dbug)
+                self.whisper = mmguero.dynamic_import("whisper", "openai-whisper", debug=verbose)
                 if not self.whisper:
                     raise Exception("Unable to initialize Whisper API")
 
@@ -920,19 +929,19 @@ class WhisperPlugger(Plugger):
             chunkingWorkDir=chunkingWorkDir,
             parallelEncoding=parallelEncoding,
             maxWorkers=maxWorkers,
-            dbug=dbug,
+            verbose=verbose,
         )
 
         if self.debug:
             if inputTranscript:
-                mmguero.eprint(f'Using input transcript (skipping speech recognition)')
+                self.logger.info(f'Using input transcript (skipping speech recognition)')
             elif self.remote_url:
-                mmguero.eprint(f'Remote Whisper URL: {self.remote_url}')
-                mmguero.eprint(f'API Timeout: {self.api_timeout}')
-                mmguero.eprint(f'Poll Interval: {self.poll_interval}')
+                self.logger.info(f'Remote Whisper URL: {self.remote_url}')
+                self.logger.info(f'API Timeout: {self.api_timeout}')
+                self.logger.info(f'Poll Interval: {self.poll_interval}')
             else:
-                mmguero.eprint(f'Model directory: {mDir}')
-                mmguero.eprint(f'Model name: {mName}')
+                self.logger.info(f'Model directory: {mDir}')
+                self.logger.info(f'Model name: {mName}')
 
     def __del__(self):
         super().__del__()
@@ -946,7 +955,7 @@ class WhisperPlugger(Plugger):
             self._RecognizeSpeechLocal()
 
         if self.debug:
-            mmguero.eprint(json.dumps(self.wordList))
+            mmguero.eprint(f"Speech recognition complete: {len(self.wordList)} words transcribed")
 
         if self.outputJson:
             TranscriptManager.save_transcript(
@@ -989,7 +998,7 @@ class WhisperPlugger(Plugger):
             data = {'word_timestamps': True}
             
             if self.debug:
-                mmguero.eprint(f'Uploading to {self.remote_url}/transcription/')
+                self.logger.info(f'Uploading to {self.remote_url}/transcription/')
             
             response = requests.post(
                 f'{self.remote_url}/transcription/',
@@ -1092,7 +1101,7 @@ def RunMonkeyPlug():
     parser.add_argument(
         "-v",
         "--verbose",
-        dest="debug",
+        dest="verbose",
         type=mmguero.str2bool,
         nargs="?",
         const=True,
@@ -1319,7 +1328,7 @@ def RunMonkeyPlug():
         metavar="<string>",
         type=str,
         default=None,
-        help="Working directory for audio chunks (default: same as input file)",
+        help="Working directory for audio chunks (default: system temp directory)",
     )
     chunkingArgGroup.add_argument(
         "--parallel-encoding",
@@ -1418,7 +1427,7 @@ def RunMonkeyPlug():
         parser.print_help()
         exit(2)
 
-    if args.debug:
+    if args.verbose:
         mmguero.eprint(os.path.join(script_path, script_name))
         mmguero.eprint("Arguments: {}".format(sys.argv[1:]))
         mmguero.eprint("Arguments: {}".format(args))
@@ -1455,7 +1464,7 @@ def RunMonkeyPlug():
             chunkingWorkDir=args.chunkingWorkDir,
             parallelEncoding=args.parallelEncoding,
             maxWorkers=args.maxWorkers,
-            dbug=args.debug,
+            verbose=args.verbose,
         )
 
     elif args.speechRecMode in [SPEECH_REC_MODE_WHISPER, SPEECH_REC_MODE_REMOTE_WHISPER]:
@@ -1502,7 +1511,7 @@ def RunMonkeyPlug():
             chunkingWorkDir=args.chunkingWorkDir,
             parallelEncoding=args.parallelEncoding,
             maxWorkers=args.maxWorkers,
-            dbug=args.debug,
+            verbose=args.verbose,
         )
     
     else:

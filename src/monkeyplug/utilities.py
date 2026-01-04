@@ -2,10 +2,104 @@
 # -*- coding: utf-8 -*-
 """FFmpeg command construction and audio processing utilities for monkeyplug."""
 
+import datetime
 import json
+import logging
 import mmguero
 import os
 import subprocess
+import sys
+
+
+class MonkeyplugLogger:
+    """Centralized logging for monkeyplug - handles console and file output."""
+    
+    def __init__(self, output_file_path=None, enabled=False, prefix=None):
+        """
+        Initialize logger.
+        
+        Args:
+            output_file_path: Path to output file (log will be saved alongside)
+            enabled: Whether logging is enabled (verbose mode)
+            prefix: Optional prefix for log messages (e.g., "[AudioChunker]")
+        """
+        self.enabled = enabled
+        self.prefix = prefix
+        self.log_file = None
+        self.logger = None
+        
+        if enabled and output_file_path:
+            self._setup_file_logging(output_file_path)
+    
+    def _setup_file_logging(self, output_file_path):
+        """Setup file logging based on output file path."""
+        output_base = os.path.splitext(output_file_path)[0]
+        self.log_file = f"{output_base}.log"
+        
+        # Create a unique logger for this instance
+        logger_name = f'monkeyplug_{id(self)}'
+        self.logger = logging.getLogger(logger_name)
+        self.logger.setLevel(logging.DEBUG)
+        self.logger.handlers.clear()
+        
+        # Add file handler
+        file_handler = logging.FileHandler(self.log_file, mode='w')
+        file_handler.setLevel(logging.DEBUG)
+        file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+        self.logger.addHandler(file_handler)
+        
+        self.logger.info(f"Log file created: {self.log_file}")
+        mmguero.eprint(f"Log file: {self.log_file}")
+    
+    def log(self, message, level='info'):
+        """
+        Log a message to console and file.
+        
+        Args:
+            message: Message to log
+            level: Log level ('info', 'warning', 'error', 'debug')
+        """
+        if not self.enabled:
+            return
+        
+        # Build formatted message
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        console_prefix = f"[{timestamp}]"
+        if self.prefix:
+            console_prefix += f" {self.prefix}"
+        console_message = f"{console_prefix} {message}"
+        
+        # Console output
+        mmguero.eprint(console_message)
+        
+        # File output (without timestamp - logger adds it)
+        if self.logger:
+            file_message = f"{self.prefix} {message}" if self.prefix else message
+            log_method = getattr(self.logger, level.lower(), self.logger.info)
+            log_method(file_message)
+    
+    def log_section(self, title):
+        """Log a section header with separator lines."""
+        separator = "=" * 60
+        self.log(separator)
+        self.log(title)
+        self.log(separator)
+    
+    def info(self, message):
+        """Log info message."""
+        self.log(message, level='info')
+    
+    def warning(self, message):
+        """Log warning message."""
+        self.log(message, level='warning')
+    
+    def error(self, message):
+        """Log error message."""
+        self.log(message, level='error')
+    
+    def debug(self, message):
+        """Log debug message."""
+        self.log(message, level='debug')
 
 
 class FFmpegCommandBuilder:
@@ -142,11 +236,24 @@ class FFmpegRunner:
         result, output = FFmpegRunner.run_command(cmd, debug=debug)
         
         if result != 0 or not os.path.isfile(output_file):
+            # Capture error details for exception message
+            error_msg = f"Could not encode {input_file}"
+            if result != 0:
+                error_msg += f" (exit code: {result})"
+            if not os.path.isfile(output_file):
+                error_msg += " (output file not created)"
+            
+            # Always show error details regardless of debug mode
             if debug:
                 mmguero.eprint(' '.join(mmguero.flatten(cmd)))
                 mmguero.eprint(f"Return code: {result}")
                 mmguero.eprint(output)
-            raise ValueError(f"Could not encode {input_file}")
+            
+            # Include output in exception for better error reporting
+            if output:
+                error_msg += f" - FFmpeg output: {output[:500]}"  # Limit to 500 chars
+            
+            raise ValueError(error_msg)
         return output_file
     
     @staticmethod
@@ -427,7 +534,9 @@ class TranscriptManager:
                 str.maketrans('', '', string.punctuation)
             )
             
-            word['scrub'] = (scrubbed in swears_map and 
+            # Don't censor empty strings (e.g., punctuation-only words like "%", "!", etc.)
+            word['scrub'] = (scrubbed and 
+                           scrubbed in swears_map and 
                            word_conf >= confidence_threshold)
         
         if debug:
