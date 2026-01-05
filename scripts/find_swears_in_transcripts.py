@@ -29,12 +29,22 @@ def load_swear_words(swear_file_path: str) -> Set[str]:
     
     return swear_words
 
-def find_profanity_in_transcript(transcript_data: List[Dict], swear_words: Set[str]) -> List[Dict]:
+def find_profanity_in_transcript(transcript_data: List[Dict], swear_words: Set[str], 
+                                confidence_threshold: float = 0.65) -> tuple:
     """
     Find all profanity instances in a transcript.
-    Returns list of matching words with their metadata.
+    Returns tuple of (all_matches, censored_matches) where censored_matches meet confidence threshold.
+    
+    Args:
+        transcript_data: List of word dictionaries from transcript
+        swear_words: Set of profanity words to match against
+        confidence_threshold: Minimum confidence (0.0-1.0) to actually censor (default: 0.65)
+    
+    Returns:
+        tuple: (all_profanity_matches, censored_matches)
     """
-    profanity_matches = []
+    all_matches = []
+    censored_matches = []
     
     for word_data in transcript_data:
         word = word_data.get('word', '').lower().strip()
@@ -42,43 +52,70 @@ def find_profanity_in_transcript(transcript_data: List[Dict], swear_words: Set[s
         word_clean = word.strip('.,!?;:\'"')
         
         if word_clean in swear_words:
+            confidence = word_data.get('conf', 1.0)
             match = {
                 'word': word_data.get('word'),
                 'word_clean': word_clean,
                 'start': word_data.get('start'),
                 'end': word_data.get('end'),
-                'confidence': word_data.get('conf'),
+                'confidence': confidence,
             }
-            profanity_matches.append(match)
+            all_matches.append(match)
             
-            # Mark in original data
-            word_data['scrub'] = True
+            # Only mark for censoring if confidence meets threshold
+            if confidence >= confidence_threshold:
+                censored_matches.append(match)
+                word_data['scrub'] = True
+            else:
+                word_data['scrub'] = False
     
-    return profanity_matches
+    return all_matches, censored_matches
 
-def process_transcript_file(transcript_path: str, swear_words: Set[str]) -> Dict:
+def process_transcript_file(transcript_path: str, swear_words: Set[str], 
+                           confidence_threshold: float = 0.65) -> Dict:
     """
     Process a single transcript file and return profanity report.
+    
+    Args:
+        transcript_path: Path to transcript JSON file
+        swear_words: Set of profanity words
+        confidence_threshold: Minimum confidence to censor (default: 0.65)
+    
+    Returns:
+        Dict with profanity analysis results
     """
     with open(transcript_path, 'r', encoding='utf-8') as f:
         transcript_data = json.load(f)
     
-    profanity_matches = find_profanity_in_transcript(transcript_data, swear_words)
+    all_matches, censored_matches = find_profanity_in_transcript(
+        transcript_data, swear_words, confidence_threshold
+    )
     
     return {
         'file': transcript_path,
         'total_words': len(transcript_data),
-        'profanity_count': len(profanity_matches),
-        'matches': profanity_matches
+        'profanity_found': len(all_matches),
+        'profanity_censored': len(censored_matches),
+        'profanity_filtered': len(all_matches) - len(censored_matches),
+        'all_matches': all_matches,
+        'censored_matches': censored_matches
     }
 
-def process_all_transcripts(transcript_dir: str, swear_file: str, output_file: str = None):
+def process_all_transcripts(transcript_dir: str, swear_file: str, 
+                           confidence_threshold: float = 0.65, output_file: str = None):
     """
     Process all transcript JSON files in a directory.
+    
+    Args:
+        transcript_dir: Directory containing transcript JSON files
+        swear_file: Path to swear words JSON file
+        confidence_threshold: Minimum confidence to censor (default: 0.65)
+        output_file: Optional output file for JSON report
     """
     # Load swear words
     swear_words = load_swear_words(swear_file)
     print(f"Loaded {len(swear_words)} swear words from {swear_file}")
+    print(f"Using confidence threshold: {confidence_threshold} (only words with confidence >= {confidence_threshold} will be censored)")
     
     # Find all transcript JSON files
     transcript_dir_path = Path(transcript_dir)
@@ -92,26 +129,45 @@ def process_all_transcripts(transcript_dir: str, swear_file: str, output_file: s
     
     # Process each transcript
     results = []
-    total_profanity = 0
+    total_found = 0
+    total_censored = 0
+    total_filtered = 0
     
     for transcript_file in transcript_files:
         print(f"\nProcessing: {transcript_file.name}")
-        result = process_transcript_file(str(transcript_file), swear_words)
+        result = process_transcript_file(str(transcript_file), swear_words, confidence_threshold)
         results.append(result)
-        total_profanity += result['profanity_count']
+        total_found += result['profanity_found']
+        total_censored += result['profanity_censored']
+        total_filtered += result['profanity_filtered']
         
-        print(f"  Found {result['profanity_count']} instances of profanity")
+        print(f"  Found {result['profanity_found']} instances of profanity")
+        print(f"  Would censor {result['profanity_censored']} (confidence >= {confidence_threshold})")
+        if result['profanity_filtered'] > 0:
+            print(f"  Filtered out {result['profanity_filtered']} (low confidence)")
         
-        # Print all matches
-        if result['matches']:
-            print("  All matches:")
-            for match in result['matches']:
-                print(f"    - '{match['word']}' at {match['start']:.2f}s - {match['end']:.2f}s")
+        # Print censored matches
+        if result['censored_matches']:
+            print("  Censored matches:")
+            for match in result['censored_matches']:
+                print(f"    - '{match['word']}' at {match['start']:.2f}s - {match['end']:.2f}s (conf: {match['confidence']:.3f})")
+        
+        # Print filtered matches
+        if result['profanity_filtered'] > 0:
+            filtered = [m for m in result['all_matches'] if m['confidence'] < confidence_threshold]
+            print("  Filtered (low confidence):")
+            for match in filtered[:5]:  # Show first 5
+                print(f"    - '{match['word']}' at {match['start']:.2f}s - {match['end']:.2f}s (conf: {match['confidence']:.3f})")
+            if len(filtered) > 5:
+                print(f"    ... and {len(filtered) - 5} more")
     
     # Generate summary report
     summary = {
         'total_transcripts': len(transcript_files),
-        'total_profanity_instances': total_profanity,
+        'confidence_threshold': confidence_threshold,
+        'total_profanity_found': total_found,
+        'total_profanity_censored': total_censored,
+        'total_profanity_filtered': total_filtered,
         'swear_words_loaded': len(swear_words),
         'results': results
     }
@@ -127,8 +183,11 @@ def process_all_transcripts(transcript_dir: str, swear_file: str, output_file: s
     print(f"SUMMARY")
     print(f"{'='*60}")
     print(f"Total transcripts processed: {summary['total_transcripts']}")
-    print(f"Total profanity instances: {summary['total_profanity_instances']}")
+    print(f"Total profanity found: {summary['total_profanity_found']}")
+    print(f"Total that would be censored: {summary['total_profanity_censored']} (confidence >= {confidence_threshold})")
+    print(f"Total filtered out: {summary['total_profanity_filtered']} (low confidence)")
     print(f"Swear words in dictionary: {len(swear_words)}")
+    print(f"Confidence threshold: {confidence_threshold}")
     
     # # Generate FFmpeg filter commands
     # print(f"\n{'='*60}")
@@ -182,12 +241,20 @@ def main():
         help='Path for the output report JSON file (default: profanity_report.json)'
     )
     
+    parser.add_argument(
+        '--confidence-threshold',
+        type=float,
+        default=0.65,
+        help='Minimum confidence level (0.0-1.0) required to censor a word (default: 0.65, matching monkeyplug default)'
+    )
+    
     args = parser.parse_args()
     
     # Process all transcripts and generate report
     summary = process_all_transcripts(
         transcript_dir=args.transcript_dir,
         swear_file=args.swear_words_file,
+        confidence_threshold=args.confidence_threshold,
         output_file=args.output_report
     )
     
