@@ -215,6 +215,7 @@ class Plugger(object):
     forceDespiteTag = False
     aParams = None
     tags = None
+    remoteParams: dict = {}
 
     ######## init #################################################################
     def __init__(
@@ -245,6 +246,7 @@ class Plugger(object):
         parallelEncoding=False,
         maxWorkers=None,
         verbose=False,
+        remoteParams=None,
     ):
         self.padSecPre = padMsecPre / 1000.0
         self.padSecPost = padMsecPost / 1000.0
@@ -265,6 +267,7 @@ class Plugger(object):
         self.chunkingWorkDir = chunkingWorkDir if chunkingWorkDir else tempfile.gettempdir()
         self.parallelEncoding = parallelEncoding
         self.maxWorkers = maxWorkers
+        self.remoteParams = remoteParams if remoteParams else {}
 
         # determine input file name, or download and save file
         if (iFileSpec is not None) and os.path.isfile(iFileSpec):
@@ -870,6 +873,7 @@ class WhisperPlugger(Plugger):
         parallelEncoding=False,
         maxWorkers=None,
         verbose=False,
+        remoteParams=None,
     ):
         # Handle remote URL - add http:// if no scheme provided
         if remoteUrl:
@@ -930,6 +934,7 @@ class WhisperPlugger(Plugger):
             parallelEncoding=parallelEncoding,
             maxWorkers=maxWorkers,
             verbose=verbose,
+            remoteParams=remoteParams,
         )
 
         if self.debug:
@@ -1004,6 +1009,7 @@ class WhisperPlugger(Plugger):
                 f'{self.remote_url}/transcription/',
                 files=files,
                 data=data,
+                params=self.remoteParams,
                 timeout=self.api_timeout
             )
             response.raise_for_status()
