@@ -12,6 +12,7 @@
 3. Each recognized word is checked against a [list](./src/monkeyplug/swears.txt) of profanity or other words you'd like muted (supports text or [JSON format](./SWEARS_JSON_FORMAT.md))
 4. Words are only censored if the speech recognition confidence level meets or exceeds the threshold (default: 65%, configurable via `--confidence-threshold`)
 5. [`ffmpeg`](https://www.ffmpeg.org/) is used to create a cleaned audio file, muting or "bleeping" the objectional words
+6. Optionally, the transcript can be saved for reuse in future processing runs
 
 You can then use your favorite media player to play the cleaned audio file.
 
@@ -54,17 +55,18 @@ To install FFmpeg, use your operating system's package manager or install binari
 ## usage
 
 ```
-usage: monkeyplug.py <arguments>
-
-monkeyplug.py
+usage: monkeyplug <arguments>
 
 options:
-  -v, --verbose [true|false]
+  -h, --help            show this help message and exit
+  -v [true|false], --verbose [true|false]
                         Verbose/debug output
   -m, --mode <string>   Speech recognition engine (whisper|vosk|remote-whisper) (default: whisper)
   -i, --input <string>  Input file (or URL)
   -o, --output <string>
                         Output file
+  -w <profanity file>, --swears <profanity file>
+                        text or JSON file containing profanity (default: "swears.txt")
   --output-json <string>
                         Output file to store transcript JSON
   --input-transcript <string>
@@ -74,12 +76,18 @@ options:
                         text or JSON file containing profanity (default: "swears.txt")
   --confidence-threshold <float>
                         Minimum confidence level (0.0-1.0) required to censor a word (default: 0.65)
+  --force-retranscribe  Force new transcription even if transcript file exists (overrides automatic reuse)
   -a, --audio-params APARAMS
                         Audio parameters for ffmpeg (default depends on output audio codec)
-  -c, --channels <int>  Audio output channels (default: 2)
-  -s, --sample-rate <int>
+  -c <int>, --channels <int>
+                        Audio output channels (default: 2)
+  -s <int>, --sample-rate <int>
                         Audio output sample rate (default: 48000)
-  -f, --format <string>
+  -r <str>, --bitrate <str>
+                        Audio output bitrate (default: 256K)
+  -q <int>, --vorbis-qscale <int>
+                        qscale for libvorbis output (default: 5)
+  -f <string>, --format <string>
                         Output file format (default: inferred from extension of --output, or "MATCH")
   --pad-milliseconds <int>
                         Milliseconds to pad on either side of muted segments (default: 0)
@@ -87,9 +95,9 @@ options:
                         Milliseconds to pad before muted segments (default: 0)
   --pad-milliseconds-post <int>
                         Milliseconds to pad after muted segments (default: 0)
-  -b, --beep [true|false]
+  -b [true|false], --beep [true|false]
                         Beep instead of silence
-  -h, --beep-hertz <int>
+  -z <int>, --beep-hertz <int>
                         Beep frequency hertz (default: 1000)
   --beep-mix-normalize [true|false]
                         Normalize mix of audio and beeps (default: False)
@@ -230,6 +238,37 @@ Alternately, a [Dockerfile](./docker/Dockerfile) is provided to allow you to run
     - oci.guero.org/monkeyplug:whisper-large
 
 then run [`monkeyplug-docker.sh`](./docker/monkeyplug-docker.sh) inside the directory where your audio files are located.
+
+## Transcript Workflow
+
+**monkeyplug** supports saving and reusing transcripts to improve workflow efficiency:
+
+### Save Transcript for Later Reuse
+
+```bash
+# Generate transcript once and save it
+monkeyplug -i input.mp3 -o output.mp3 --save-transcript
+
+# This creates output.mp3 and output_transcript.json
+```
+
+### Automatic Transcript Reuse
+
+```bash
+# Second run: Automatically detects and reuses transcript (22x faster!)
+monkeyplug -i input.mp3 -o output.mp3 --save-transcript
+# Finds output_transcript.json and reuses it automatically
+
+# Force new transcription when needed
+monkeyplug -i input.mp3 -o output.mp3 --save-transcript --force-retranscribe
+```
+
+### Manual Transcript Loading
+
+```bash
+# Explicitly specify transcript to load
+monkeyplug -i input.mp3 -o output_strict.mp3 --input-transcript output_transcript.json -w strict_swears.txt
+```
 
 ## Contributing
 

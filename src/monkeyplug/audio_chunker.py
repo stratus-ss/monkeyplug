@@ -47,7 +47,7 @@ class AudioChunker:
     - Reassembles chunks and restores metadata
     """
 
-    MAX_CHUNK_SIZE_MB = 50
+    MAX_CHUNK_SIZE_MB = 150
     MAX_CHUNK_SIZE_BYTES = MAX_CHUNK_SIZE_MB * 1024 * 1024
     
     SILENCE_NOISE_THRESHOLD = "-40dB"  # Noise level below which is considered silence
@@ -128,6 +128,16 @@ class AudioChunker:
         """
         file_size = os.path.getsize(source_file)
         return file_size > self.MAX_CHUNK_SIZE_BYTES
+
+    def _log(self, message: str):
+        """Log an info message if debug is enabled."""
+        if self.debug:
+            self.logger.info(message)
+
+    def _log_section(self, message: str):
+        """Log a section header if debug is enabled."""
+        if self.debug:
+            self.logger.log_section(message)
 
     def process_with_chunking(self, source_file: str, output_file: str):
         """

@@ -4,6 +4,9 @@
 import argparse
 import base64
 import errno
+import importlib
+import importlib.metadata
+import importlib.util
 import json
 import mmguero
 import mutagen
@@ -37,15 +40,26 @@ from monkeyplug.utilities import (
 ###################################################################################################
 CHANNELS_REPLACER = 'CHANNELS'
 SAMPLE_RATE_REPLACER = 'SAMPLE'
+BIT_RATE_REPLACER = 'BITRATE'
+VORBIS_QSCALE_REPLACER = 'QSCALE'
 AUDIO_DEFAULT_PARAMS_BY_FORMAT = {
     "flac": ["-c:a", "flac", "-ar", SAMPLE_RATE_REPLACER, "-ac", CHANNELS_REPLACER],
-    "m4a": ["-c:a", "aac", "-b:a", "128K", "-ar", SAMPLE_RATE_REPLACER, "-ac", CHANNELS_REPLACER],
-    "m4b": ["-c:a", "aac", "-b:a", "128K", "-ar", SAMPLE_RATE_REPLACER, "-ac", CHANNELS_REPLACER],
-    "aac": ["-c:a", "aac", "-b:a", "128K", "-ar", SAMPLE_RATE_REPLACER, "-ac", CHANNELS_REPLACER],
-    "mp3": ["-c:a", "libmp3lame", "-b:a", "128K", "-ar", SAMPLE_RATE_REPLACER, "-ac", CHANNELS_REPLACER],
-    "ogg": ["-c:a", "libvorbis", "-qscale:a", "5", "-ar", SAMPLE_RATE_REPLACER, "-ac", CHANNELS_REPLACER],
-    "opus": ["-c:a", "libopus", "-b:a", "128K", "-ar", SAMPLE_RATE_REPLACER, "-ac", CHANNELS_REPLACER],
-    "ac3": ["-c:a", "ac3", "-b:a", "128K", "-ar", SAMPLE_RATE_REPLACER, "-ac", CHANNELS_REPLACER],
+    "m4a": ["-c:a", "aac", "-b:a", BIT_RATE_REPLACER, "-ar", SAMPLE_RATE_REPLACER, "-ac", CHANNELS_REPLACER],
+    "m4b": ["-c:a", "aac", "-b:a", BIT_RATE_REPLACER, "-ar", SAMPLE_RATE_REPLACER, "-ac", CHANNELS_REPLACER],
+    "aac": ["-c:a", "aac", "-b:a", BIT_RATE_REPLACER, "-ar", SAMPLE_RATE_REPLACER, "-ac", CHANNELS_REPLACER],
+    "mp3": ["-c:a", "libmp3lame", "-b:a", BIT_RATE_REPLACER, "-ar", SAMPLE_RATE_REPLACER, "-ac", CHANNELS_REPLACER],
+    "ogg": [
+        "-c:a",
+        "libvorbis",
+        "-qscale:a",
+        VORBIS_QSCALE_REPLACER,
+        "-ar",
+        SAMPLE_RATE_REPLACER,
+        "-ac",
+        CHANNELS_REPLACER,
+    ],
+    "opus": ["-c:a", "libopus", "-b:a", BIT_RATE_REPLACER, "-ar", SAMPLE_RATE_REPLACER, "-ac", CHANNELS_REPLACER],
+    "ac3": ["-c:a", "ac3", "-b:a", BIT_RATE_REPLACER, "-ar", SAMPLE_RATE_REPLACER, "-ac", CHANNELS_REPLACER],
     "wav": ["-c:a", "pcm_s16le", "-ar", SAMPLE_RATE_REPLACER, "-ac", CHANNELS_REPLACER],
 }
 AUDIO_CODEC_TO_FORMAT = {
@@ -61,6 +75,8 @@ AUDIO_CODEC_TO_FORMAT = {
 AUDIO_DEFAULT_FORMAT = "mp3"
 AUDIO_DEFAULT_CHANNELS = 2
 AUDIO_DEFAULT_SAMPLE_RATE = 48000
+AUDIO_DEFAULT_BIT_RATE = "256K"
+AUDIO_DEFAULT_VORBIS_QSCALE = 5
 AUDIO_MATCH_FORMAT = "MATCH"
 AUDIO_INTERMEDIATE_PARAMS = ["-c:a", "pcm_s16le", "-ac", "1", "-ar", "16000"]
 AUDIO_DEFAULT_WAV_FRAMES_CHUNK = 8000
@@ -232,9 +248,12 @@ class Plugger(object):
         reportFormat="txt",
         inputTranscript=None,
         saveTranscript=False,
+        forceRetranscribe=False,
         aParams=None,
         aChannels=AUDIO_DEFAULT_CHANNELS,
         aSampleRate=AUDIO_DEFAULT_SAMPLE_RATE,
+        aBitRate=AUDIO_DEFAULT_BIT_RATE,
+        aVorbisQscale=AUDIO_DEFAULT_VORBIS_QSCALE,
         padMsecPre=0,
         padMsecPost=0,
         beep=False,
@@ -299,8 +318,12 @@ class Plugger(object):
         self.outputFileSpec = oFileSpec if oFileSpec else self.inputFileParts[0] + "_clean"
         if self.outputFileSpec:
             outParts = os.path.splitext(self.outputFileSpec)
-            # Only use output file's extension if one exists and no format was specified
-            if not oAudioFileFormat and outParts[1]:
+            if (
+                ((not oAudioFileFormat) or (str(oAudioFileFormat).upper() == AUDIO_MATCH_FORMAT))
+                and oFileSpec
+                and (len(outParts) > 1)
+                and outParts[1]
+            ):
                 oAudioFileFormat = outParts[1]
 
         if str(oAudioFileFormat).upper() == AUDIO_MATCH_FORMAT:
@@ -316,8 +339,9 @@ class Plugger(object):
                         break
 
         elif oAudioFileFormat:
-            # output filename specified with extension, use base name to avoid duplication
-            self.outputFileSpec = outParts[0] + '.' + oAudioFileFormat.lower().lstrip('.')
+            # output filename not specified, base on input filename with specified format
+            newSuffix = '.' + oAudioFileFormat.lower().lstrip('.')
+            self.outputFileSpec = mmguero.remove_suffix(self.outputFileSpec, newSuffix) + newSuffix
 
         else:
             # can't determine what output file audio format should be
@@ -344,6 +368,8 @@ class Plugger(object):
             {
                 CHANNELS_REPLACER: str(aChannels),
                 SAMPLE_RATE_REPLACER: str(aSampleRate),
+                BIT_RATE_REPLACER: str(aBitRate),
+                VORBIS_QSCALE_REPLACER: str(aVorbisQscale),
             }.get(aParam, aParam)
             for aParam in self.aParams
         ]
@@ -384,6 +410,13 @@ class Plugger(object):
             if self.debug:
                 mmguero.eprint(f'Auto-generated transcript output: {self.outputJson}')
         
+        # Auto-detect existing transcript for reuse (unless force flag set or explicit input provided)
+        if self.saveTranscript and not self.inputTranscript and self.outputJson and not forceRetranscribe:
+            if os.path.exists(self.outputJson):
+                self.inputTranscript = self.outputJson
+                if self.debug:
+                    mmguero.eprint(f'Found existing transcript, reusing: {self.inputTranscript}')
+
         # If JSON output is specified, ensure its directory exists too
         if self.outputJson:
             self._ensure_directory_exists(self.outputJson, "JSON output directory")
@@ -393,7 +426,7 @@ class Plugger(object):
             self.swearsFileSpec = iSwearsFileSpec
         else:
             raise IOError(errno.ENOENT, os.strerror(errno.ENOENT), iSwearsFileSpec)
-        
+
         self._load_swears_file()
 
         if self.debug:
@@ -431,7 +464,6 @@ class Plugger(object):
             os.makedirs(directory, exist_ok=True)
         return directory
 
-
     ######## _load_swears_file ####################################################
     def _load_swears_file(self):
         """Load swears from text or JSON format"""
@@ -448,31 +480,31 @@ class Plugger(object):
                     is_json = True
             except (json.JSONDecodeError, ValueError):
                 pass
-        
+
         if is_json:
             self._load_swears_from_json()
         else:
             self._load_swears_from_text()
-        
+
         if self.debug:
             self.logger.info(f'Loaded {len(self.swearsMap)} profanity entries from {self.swearsFileSpec}')
-    
+
     def _load_swears_from_json(self):
         """Load swears from JSON format - simple array of strings
-        
+
         Format: ["word1", "word2", "word3", ...]
         Example: https://github.com/zautumnz/profane-words/blob/master/words.json
         """
         with open(self.swearsFileSpec, 'r') as f:
             data = json.load(f)
-        
+
         if not isinstance(data, list):
             raise ValueError(f"JSON swears file must contain an array of strings, got {type(data).__name__}")
-        
+
         for item in data:
             if isinstance(item, str) and item.strip():
                 self.swearsMap[scrubword(item)] = "*****"
-    
+
     def _load_swears_from_text(self):
         """Load swears from pipe-delimited text format (legacy)"""
         lines = []
@@ -485,11 +517,11 @@ class Plugger(object):
     ######## _should_scrub_word ##################################################
     def _should_scrub_word(self, word_text, confidence=1.0):
         """Check if a word should be scrubbed based on swears list and confidence threshold
-        
+
         Args:
             word_text: The word to check
             confidence: Confidence score (0.0 to 1.0), defaults to 1.0
-            
+
         Returns:
             bool: True if word should be scrubbed, False otherwise
         """
@@ -505,17 +537,17 @@ class Plugger(object):
         """Load pre-generated transcript from JSON file"""
         if not self.inputTranscript:
             return False
-        
+
         if not os.path.isfile(self.inputTranscript):
             raise IOError(errno.ENOENT, os.strerror(errno.ENOENT), self.inputTranscript)
-        
+
         self.wordList = TranscriptManager.load_transcript(
             transcript_path=self.inputTranscript,
             swears_map=self.swearsMap,
             confidence_threshold=self.confidenceThreshold,
             debug=self.debug
         )
-        
+
         return True
 
     ######## CreateCleanMuteList #################################################
@@ -671,9 +703,12 @@ class VoskPlugger(Plugger):
         reportFormat="txt",
         inputTranscript=None,
         saveTranscript=False,
+        forceRetranscribe=False,
         aParams=None,
         aChannels=AUDIO_DEFAULT_CHANNELS,
         aSampleRate=AUDIO_DEFAULT_SAMPLE_RATE,
+        aBitRate=AUDIO_DEFAULT_BIT_RATE,
+        aVorbisQscale=AUDIO_DEFAULT_VORBIS_QSCALE,
         wChunk=AUDIO_DEFAULT_WAV_FRAMES_CHUNK,
         padMsecPre=0,
         padMsecPost=0,
@@ -722,9 +757,12 @@ class VoskPlugger(Plugger):
             reportFormat=reportFormat,
             inputTranscript=inputTranscript,
             saveTranscript=saveTranscript,
+            forceRetranscribe=forceRetranscribe,
             aParams=aParams,
             aChannels=aChannels,
             aSampleRate=aSampleRate,
+            aBitRate=aBitRate,
+            aVorbisQscale=aVorbisQscale,
             padMsecPre=padMsecPre,
             padMsecPost=padMsecPost,
             beep=beep,
@@ -860,9 +898,12 @@ class WhisperPlugger(Plugger):
         remoteUrl=None,
         apiTimeout=600,
         pollInterval=5,
+        forceRetranscribe=False,
         aParams=None,
         aChannels=AUDIO_DEFAULT_CHANNELS,
         aSampleRate=AUDIO_DEFAULT_SAMPLE_RATE,
+        aBitRate=AUDIO_DEFAULT_BIT_RATE,
+        aVorbisQscale=AUDIO_DEFAULT_VORBIS_QSCALE,
         padMsecPre=0,
         padMsecPost=0,
         beep=False,
@@ -891,6 +932,7 @@ class WhisperPlugger(Plugger):
         self.remote_url = remoteUrl
         self.api_timeout = apiTimeout
         self.poll_interval = pollInterval
+
         self.whisper = None
         self.model = None
         self.torch = None
@@ -921,9 +963,12 @@ class WhisperPlugger(Plugger):
             reportFormat=reportFormat,
             inputTranscript=inputTranscript,
             saveTranscript=saveTranscript,
+            forceRetranscribe=forceRetranscribe,
             aParams=aParams,
             aChannels=aChannels,
             aSampleRate=aSampleRate,
+            aBitRate=aBitRate,
+            aVorbisQscale=aVorbisQscale,
             padMsecPre=padMsecPre,
             padMsecPost=padMsecPost,
             beep=beep,
@@ -1121,10 +1166,18 @@ class WhisperPlugger(Plugger):
 
 # RunMonkeyPlug
 def RunMonkeyPlug():
+
+    package_name = __package__ or "monkeyplug"
+    try:
+        metadata = importlib.metadata.metadata(package_name)
+        version = metadata.get("Version", "unknown")
+    except importlib.metadata.PackageNotFoundError:
+        version = "source"
+
     parser = argparse.ArgumentParser(
-        description=script_name,
-        add_help=False,
-        usage="{} <arguments>".format(script_name),
+        description=f"{package_name} (v{version})",
+        add_help=True,
+        usage=f"{package_name} <arguments>",
     )
     parser.add_argument(
         "-v",
@@ -1215,10 +1268,34 @@ def RunMonkeyPlug():
         help=f"Minimum confidence level (0.0-1.0) required to censor a word (default: {CONFIDENCE_THRESHOLD_DEFAULT})",
     )
     parser.add_argument(
+        "--input-transcript",
+        dest="inputTranscript",
+        type=str,
+        default=None,
+        required=False,
+        metavar="<string>",
+        help="Load existing transcript JSON instead of performing speech recognition",
+    )
+    parser.add_argument(
+        "--save-transcript",
+        dest="saveTranscript",
+        action="store_true",
+        default=False,
+        help="Automatically save transcript JSON alongside output audio file",
+    )
+    parser.add_argument(
+        "--force-retranscribe",
+        dest="forceRetranscribe",
+        action="store_true",
+        default=False,
+        help="Force new transcription even if transcript file exists (overrides automatic reuse)",
+    )
+    parser.add_argument(
         "-a",
         "--audio-params",
-        help=f"Audio parameters for ffmpeg (default depends on output audio codec)",
+        help="Audio parameters for ffmpeg (default depends on output audio codec)",
         dest="aParams",
+        metavar="<str>",
         default=None,
     )
     parser.add_argument(
@@ -1240,6 +1317,23 @@ def RunMonkeyPlug():
         help=f"Audio output sample rate (default: {AUDIO_DEFAULT_SAMPLE_RATE})",
     )
     parser.add_argument(
+        "-r",
+        "--bitrate",
+        dest="aBitRate",
+        metavar="<str>",
+        default=AUDIO_DEFAULT_BIT_RATE,
+        help=f"Audio output bitrate (default: {AUDIO_DEFAULT_BIT_RATE})",
+    )
+    parser.add_argument(
+        "-q",
+        "--vorbis-qscale",
+        dest="aVorbisQscale",
+        metavar="<int>",
+        type=int,
+        default=AUDIO_DEFAULT_VORBIS_QSCALE,
+        help=f"qscale for libvorbis output (default: {AUDIO_DEFAULT_VORBIS_QSCALE})",
+    )
+    parser.add_argument(
         "-f",
         "--format",
         dest="outputFormat",
@@ -1255,7 +1349,7 @@ def RunMonkeyPlug():
         metavar="<int>",
         type=int,
         default=0,
-        help=f"Milliseconds to pad on either side of muted segments (default: 0)",
+        help="Milliseconds to pad on either side of muted segments (default: 0)",
     )
     parser.add_argument(
         "--pad-milliseconds-pre",
@@ -1263,7 +1357,7 @@ def RunMonkeyPlug():
         metavar="<int>",
         type=int,
         default=0,
-        help=f"Milliseconds to pad before muted segments (default: 0)",
+        help="Milliseconds to pad before muted segments (default: 0)",
     )
     parser.add_argument(
         "--pad-milliseconds-post",
@@ -1271,7 +1365,7 @@ def RunMonkeyPlug():
         metavar="<int>",
         type=int,
         default=0,
-        help=f"Milliseconds to pad after muted segments (default: 0)",
+        help="Milliseconds to pad after muted segments (default: 0)",
     )
     parser.add_argument(
         "-b",
@@ -1285,7 +1379,7 @@ def RunMonkeyPlug():
         help="Beep instead of silence",
     )
     parser.add_argument(
-        "-h",
+        "-z",
         "--beep-hertz",
         dest="beepHertz",
         metavar="<int>",
@@ -1450,15 +1544,14 @@ def RunMonkeyPlug():
     try:
         parser.error = parser.exit
         args = parser.parse_args()
-    except SystemExit as sy:
-        mmguero.eprint(sy)
-        parser.print_help()
+    except SystemExit as se:
+        mmguero.eprint(se)
         exit(2)
 
     if args.verbose:
         mmguero.eprint(os.path.join(script_path, script_name))
-        mmguero.eprint("Arguments: {}".format(sys.argv[1:]))
-        mmguero.eprint("Arguments: {}".format(args))
+        mmguero.eprint(f"Arguments: {sys.argv[1:]}")
+        mmguero.eprint(f"Arguments: {args}")
     else:
         sys.tracebacklimit = 0
 
@@ -1474,9 +1567,12 @@ def RunMonkeyPlug():
             reportFormat=args.reportFormat,
             inputTranscript=args.inputTranscript,
             saveTranscript=args.saveTranscript,
+            forceRetranscribe=args.forceRetranscribe,
             aParams=args.aParams,
             aChannels=args.aChannels,
             aSampleRate=args.aSampleRate,
+            aBitRate=args.aBitRate,
+            aVorbisQscale=args.aVorbisQscale,
             wChunk=args.voskReadFramesChunk,
             padMsecPre=args.padMsecPre if args.padMsecPre > 0 else args.padMsec,
             padMsecPost=args.padMsecPost if args.padMsecPost > 0 else args.padMsec,
@@ -1522,9 +1618,12 @@ def RunMonkeyPlug():
             remoteUrl=remote_url,
             apiTimeout=args.remoteWhisperTimeout,
             pollInterval=args.remoteWhisperPollInterval,
+            forceRetranscribe=args.forceRetranscribe,
             aParams=args.aParams,
             aChannels=args.aChannels,
             aSampleRate=args.aSampleRate,
+            aBitRate=args.aBitRate,
+            aVorbisQscale=args.aVorbisQscale,
             padMsecPre=args.padMsecPre if args.padMsecPre > 0 else args.padMsec,
             padMsecPost=args.padMsecPost if args.padMsecPost > 0 else args.padMsec,
             beep=args.beep,
@@ -1546,6 +1645,8 @@ def RunMonkeyPlug():
         raise ValueError(f"Unsupported speech recognition engine {args.speechRecMode}")
 
     print(plug.EncodeCleanAudio())
+
+    sys.exit(0)
 
 
 ###################################################################################################
