@@ -523,21 +523,13 @@ class TranscriptManager:
         with open(transcript_path, 'r') as f:
             word_list = json.load(f)
         
-        # Recalculate scrub flags with current swears list and confidence threshold
-        import string
+        # Recalculate scrub flags with current swears list
+        from monkeyplug.monkeyplug import scrubword
         for word in word_list:
             word_text = word.get('word', '')
-            word_conf = word.get('conf', 1.0)
-            
-            # Scrub word (remove punctuation, lowercase)
-            scrubbed = str(word_text).lower().strip().translate(
-                str.maketrans('', '', string.punctuation)
-            )
-            
-            # Don't censor empty strings (e.g., punctuation-only words like "%", "!", etc.)
-            word['scrub'] = (scrubbed and 
-                           scrubbed in swears_map and 
-                           word_conf >= confidence_threshold)
+            scrubbed = scrubword(word_text)
+            # Exact swear-word match bypasses confidence threshold
+            word['scrub'] = bool(scrubbed and scrubbed in swears_map)
         
         if debug:
             scrubbed_count = sum(1 for w in word_list if w.get('scrub', False))

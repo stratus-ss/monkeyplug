@@ -19,6 +19,7 @@ import pytest
 import json
 
 from monkeyplug.audio_chunker import AudioChunker, AudioChunkingError
+from monkeyplug.monkeyplug import scrubword
 
 
 class MockPlugger:
@@ -62,6 +63,14 @@ class MockPlugger:
         self.wordList = [
             {"word": "loaded", "start": 0.0, "end": 0.5, "conf": 1.0, "scrub": False}
         ]
+
+
+class TestScrubword:
+    def test_preserves_ascii_apostrophes_in_contractions(self):
+        assert scrubword("he'll") == "he'll"
+
+    def test_normalizes_curly_apostrophes_in_contractions(self):
+        assert scrubword("he’ll") == "he'll"
 
 
 class TestNeedsChunking:
@@ -217,6 +226,31 @@ class TestSplitAudioAtSilence:
             
             # Should NOT call ffmpeg split
             mock_run.assert_not_called()
+
+
+class TestAggregateTranscripts:
+    def test_aggregate_transcripts_reuses_scrubword_logic(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            plugger = MockPlugger()
+            plugger.swearsMap = {"hell": True, "damn": True}
+            plugger.confidenceThreshold = 0.70
+            chunker = AudioChunker(tmpdir, plugger)
+
+            transcript_path = Path(tmpdir) / "chunk_000_transcript.json"
+            transcript_path.write_text(json.dumps([
+                {"word": "he'll", "start": 0.0, "end": 0.5, "conf": 0.95},
+                {"word": "Damn,", "start": 1.0, "end": 1.5, "conf": 0.95},
+                {"word": "Damn.", "start": 2.0, "end": 2.5, "conf": 0.20},
+            ]))
+
+            with patch("monkeyplug.audio_chunker.TranscriptManager.get_transcript_path",
+                       return_value=str(transcript_path)):
+                chunker._aggregate_transcripts(["chunk_000.m4a"])
+
+            # he'll → "he'll" (not in swearsMap) → False
+            # Damn, → "damn" (in swearsMap) → True regardless of confidence
+            # Damn. → "damn" (in swearsMap) → True regardless of confidence
+            assert [word["scrub"] for word in plugger.wordList] == [False, True, True]
     
     @patch('monkeyplug.utilities.FFmpegRunner.get_audio_duration')
     @patch('monkeyplug.utilities.FFmpegRunner.detect_silence_points')

@@ -47,7 +47,7 @@ class AudioChunker:
     - Reassembles chunks and restores metadata
     """
 
-    MAX_CHUNK_SIZE_MB = 150
+    MAX_CHUNK_SIZE_MB = 50
     MAX_CHUNK_SIZE_BYTES = MAX_CHUNK_SIZE_MB * 1024 * 1024
     
     SILENCE_NOISE_THRESHOLD = "-40dB"  # Noise level below which is considered silence
@@ -193,14 +193,10 @@ class AudioChunker:
         for word in self.plugger.wordList:
             word_text = word.get('word', '')
             word_conf = word.get('conf', 1.0)
-            import string
-            scrubbed = str(word_text).lower().strip().translate(
-                str.maketrans('', '', string.punctuation)
-            )
-            # Don't censor empty strings (e.g., punctuation-only words like "%", "!", etc.)
-            word['scrub'] = (scrubbed and 
-                           scrubbed in self.plugger.swearsMap and 
-                           word_conf >= self.plugger.confidenceThreshold)
+            from monkeyplug.monkeyplug import scrubword
+            scrubbed = scrubword(word_text)
+            # Exact swear-word match bypasses confidence threshold
+            word['scrub'] = bool(scrubbed and scrubbed in self.plugger.swearsMap)
         
         self.logger.info(f"Aggregated {len(self.plugger.wordList)} words from {len(chunks)} chunks")
 
@@ -455,7 +451,7 @@ class AudioChunker:
         # Check for existing chunks
         pattern = re.compile(rf"^{re.escape(base_name)}_chunk_\d{{3}}\.{re.escape(file_ext)}$")
         existing_chunks = sorted([
-            str(p) for p in chunk_dir.glob(f"{base_name}_chunk_*.{file_ext}")
+            str(p) for p in chunk_dir.iterdir()
             if pattern.match(p.name) and p.is_file()
         ])
         

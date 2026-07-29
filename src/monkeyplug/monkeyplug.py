@@ -98,8 +98,12 @@ def pairwise(iterable):
     return zip(a, b)
 
 
+SCRUB_PUNCTUATION = string.punctuation.replace("'", "")
+
+
 def scrubword(value):
-    return str(value).lower().strip().translate(str.maketrans('', '', string.punctuation))
+    normalized = str(value).replace("\u2019", "'")
+    return normalized.lower().strip().translate(str.maketrans('', '', SCRUB_PUNCTUATION))
 
 
 ###################################################################################################
@@ -490,10 +494,11 @@ class Plugger(object):
             bool: True if word should be scrubbed, False otherwise
         """
         scrubbed = scrubword(word_text)
-        # Don't censor empty strings (e.g., punctuation-only words like "%", "!", etc.)
-        return (scrubbed and 
-                scrubbed in self.swearsMap and 
-                confidence >= self.confidenceThreshold)
+        if not scrubbed or scrubbed not in self.swearsMap:
+            return False
+        # Exact swear-word match bypasses confidence threshold — low confidence
+        # at segment boundaries is positional uncertainty, not recognition error.
+        return True
 
     ######## LoadTranscriptFromFile ##############################################
     def LoadTranscriptFromFile(self):
@@ -1025,10 +1030,27 @@ class WhisperPlugger(Plugger):
             return task_id
 
     def _poll_for_transcription_result(self, task_id):
-        """Poll remote service until transcription completes and return result"""
+        """Poll remote service until transcription completes and return result.
+
+        Enforces self.api_timeout as a wall-clock budget on the polling loop
+        itself (not just the initial upload). Without this, a task that gets
+        orphaned server-side (e.g. the backend process is OOM-killed mid-task
+        and the task record is never updated to a terminal state) causes this
+        loop to poll forever, deadlocking the whole cleaning job.
+        """
         import time
-        
+
+        start_time = time.monotonic()
+
         while True:
+            elapsed = time.monotonic() - start_time
+            if elapsed > self.api_timeout:
+                raise TimeoutError(
+                    f'Transcription task {task_id} did not complete within '
+                    f'{self.api_timeout}s (elapsed {elapsed:.0f}s). The backend '
+                    f'task may have been orphaned by a server-side crash/restart.'
+                )
+
             response = requests.get(f'{self.remote_url}/task/{task_id}')
             response.raise_for_status()
             data = response.json()
