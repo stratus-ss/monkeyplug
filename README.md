@@ -173,7 +173,7 @@ monkeyplug.py --mode remote-whisper -i input.mp3 -o output.mp3
 
 Monkeyplug supports saving and reusing transcripts, which is useful for:
 
-- **Faster reprocessing**: Transcribe once, then quickly test different swear lists or confidence thresholds
+- **Faster reprocessing**: Transcribe once, then quickly test different swear lists or confidence thresholds (auto-reuse can be ~22x faster than re-transcribing)
 - **Iterative refinement**: Adjust your profanity list without waiting for re-transcription
 - **Manual review**: Export transcripts to review and modify before processing
 
@@ -186,6 +186,22 @@ monkeyplug.py -i input.mp3 -o output.mp3 --save-transcript
 
 # Save transcript to specific location
 monkeyplug.py -i input.mp3 -o output.mp3 --output-json my_transcript.json
+```
+
+#### Automatic Transcript Reuse
+
+When `--save-transcript` is enabled and `--output-json` is set, a second
+run on the same input automatically detects and reuses the existing
+transcript (no `--input-transcript` flag needed). To force a fresh
+transcription and overwrite the cached transcript, pass
+`--force-retranscribe`:
+
+```bash
+# Second run: auto-reuses cached transcript (much faster)
+monkeyplug.py -i input.mp3 -o output.mp3 --save-transcript
+
+# Force new transcription when needed
+monkeyplug.py -i input.mp3 -o output.mp3 --save-transcript --force-retranscribe
 ```
 
 #### Loading Pre-existing Transcripts
@@ -238,37 +254,6 @@ Alternately, a [Dockerfile](./docker/Dockerfile) is provided to allow you to run
     - oci.guero.org/monkeyplug:whisper-large
 
 then run [`monkeyplug-docker.sh`](./docker/monkeyplug-docker.sh) inside the directory where your audio files are located.
-
-## Transcript Workflow
-
-**monkeyplug** supports saving and reusing transcripts to improve workflow efficiency:
-
-### Save Transcript for Later Reuse
-
-```bash
-# Generate transcript once and save it
-monkeyplug -i input.mp3 -o output.mp3 --save-transcript
-
-# This creates output.mp3 and output_transcript.json
-```
-
-### Automatic Transcript Reuse
-
-```bash
-# Second run: Automatically detects and reuses transcript (22x faster!)
-monkeyplug -i input.mp3 -o output.mp3 --save-transcript
-# Finds output_transcript.json and reuses it automatically
-
-# Force new transcription when needed
-monkeyplug -i input.mp3 -o output.mp3 --save-transcript --force-retranscribe
-```
-
-### Manual Transcript Loading
-
-```bash
-# Explicitly specify transcript to load
-monkeyplug -i input.mp3 -o output_strict.mp3 --input-transcript output_transcript.json -w strict_swears.txt
-```
 
 ## Contributing
 
