@@ -47,7 +47,7 @@ class AudioChunker:
     - Reassembles chunks and restores metadata
     """
 
-    MAX_CHUNK_SIZE_MB = 150
+    MAX_CHUNK_SIZE_MB = 50
     MAX_CHUNK_SIZE_BYTES = MAX_CHUNK_SIZE_MB * 1024 * 1024
     
     SILENCE_NOISE_THRESHOLD = "-40dB"  # Noise level below which is considered silence
@@ -497,8 +497,17 @@ class AudioChunker:
         )
         subprocess.run(split_cmd, check=True, capture_output=True)
         
-        # Collect created chunks
-        chunks = sorted(chunk_dir.glob(f"{base_name}_chunk_*.{file_ext}"))
+        # Collect created chunks. base_name (the book title) commonly contains the
+        # Audible ASIN in square brackets (e.g. "...Book 1 [B0CVCYB19Y]"), which are
+        # glob wildcard metacharacters -- chunk_dir.glob(f"{base_name}_chunk_*...")
+        # would silently match nothing even though ffmpeg created the files, causing
+        # every fresh split to fall back to treating the whole original file as a
+        # single chunk. Use the same regex-based match as the existing-chunks check
+        # above so literal brackets/parens/etc. in the filename are handled correctly.
+        chunks = sorted([
+            p for p in chunk_dir.iterdir()
+            if pattern.match(p.name) and p.is_file()
+        ])
         chunk_paths = [str(chunk) for chunk in chunks]
         
         if not chunk_paths:

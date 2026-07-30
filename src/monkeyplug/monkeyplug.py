@@ -467,6 +467,14 @@ class Plugger(object):
     ######## _load_swears_file ####################################################
     def _load_swears_file(self):
         """Load swears from text or JSON format"""
+        # swearsMap is declared as a class attribute default ({}); without this,
+        # in-place mutation (self.swearsMap[x] = y) below would mutate the SHARED
+        # class-level dict instead of creating a per-instance attribute. That means
+        # it would never appear in self.__dict__ and would be silently dropped when
+        # this object is pickled for ProcessPoolExecutor workers (parallel chunk
+        # encoding), causing workers to see an empty swearsMap and scrub nothing.
+        self.swearsMap = {}
+
         # Try to detect and parse JSON first
         is_json = False
         if self.swearsFileSpec.lower().endswith('.json'):

@@ -74,45 +74,46 @@ class TestScrubword:
 
 
 class TestNeedsChunking:
-    """Test file size-based chunking decisions."""
-    
+    """Test file size-based chunking decisions.
+
+    Sizes are derived from AudioChunker.MAX_CHUNK_SIZE_MB rather than
+    hardcoded so these tests stay correct if the threshold changes.
+    """
+
     def test_large_file_needs_chunking(self):
-        """File larger than 150MB should require chunking."""
+        """File larger than the threshold should require chunking."""
         with tempfile.TemporaryDirectory() as tmpdir:
             plugger = MockPlugger()
             chunker = AudioChunker(tmpdir, plugger)
-            
+
             large_file = os.path.join(tmpdir, "large.m4a")
             with open(large_file, 'wb') as f:
-                # Write 200MB
-                f.write(b'x' * (200 * 1024 * 1024))
-            
+                f.write(b'x' * ((chunker.MAX_CHUNK_SIZE_MB + 50) * 1024 * 1024))
+
             assert chunker.needs_chunking(large_file) is True
-    
+
     def test_small_file_no_chunking(self):
-        """File smaller than 150MB should not require chunking."""
+        """File smaller than the threshold should not require chunking."""
         with tempfile.TemporaryDirectory() as tmpdir:
             plugger = MockPlugger()
             chunker = AudioChunker(tmpdir, plugger)
-            
+
             small_file = os.path.join(tmpdir, "small.m4a")
             with open(small_file, 'wb') as f:
-                # Write 50MB
-                f.write(b'x' * (50 * 1024 * 1024))
-            
+                f.write(b'x' * ((chunker.MAX_CHUNK_SIZE_MB // 2) * 1024 * 1024))
+
             assert chunker.needs_chunking(small_file) is False
-    
+
     def test_exactly_at_threshold(self):
-        """File exactly at 150MB threshold should not require chunking."""
+        """File exactly at the threshold should not require chunking."""
         with tempfile.TemporaryDirectory() as tmpdir:
             plugger = MockPlugger()
             chunker = AudioChunker(tmpdir, plugger)
-            
+
             threshold_file = os.path.join(tmpdir, "threshold.m4a")
             with open(threshold_file, 'wb') as f:
-                # Write exactly 150MB
-                f.write(b'x' * (150 * 1024 * 1024))
-            
+                f.write(b'x' * (chunker.MAX_CHUNK_SIZE_MB * 1024 * 1024))
+
             assert chunker.needs_chunking(threshold_file) is False
 
 
@@ -286,7 +287,48 @@ class TestAggregateTranscripts:
             # Should create new chunks
             assert len(result) == 2
             assert mock_run.called
-    
+
+    @patch('monkeyplug.utilities.FFmpegRunner.get_audio_duration')
+    @patch('monkeyplug.utilities.FFmpegRunner.detect_silence_points')
+    @patch('subprocess.run')
+    def test_creates_new_chunks_with_asin_brackets_in_filename(self, mock_run, mock_detect, mock_duration):
+        """Regression test: base_name containing "[ASIN]" (as Libation filenames
+        commonly do, e.g. "Book Title [B0CVCYB19Y]") must not break chunk
+        collection. glob() treats "[...]" as a wildcard character class, so
+        chunk_dir.glob(f"{base_name}_chunk_*...") would silently match zero
+        files even though ffmpeg created them, causing a fresh split to fall
+        back to "no chunks created, using original" every time.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            plugger = MockPlugger()
+            chunker = AudioChunker(tmpdir, plugger)
+
+            source_file = os.path.join(tmpdir, "Some Book [B0CVCYB19Y].m4a")
+            with open(source_file, 'wb') as f:
+                f.write(b'x' * (200 * 1024 * 1024))
+
+            file_id = "TEST123"
+
+            mock_duration.return_value = 3600.0
+            mock_detect.return_value = [1800.0]
+
+            def create_chunks(*args, **kwargs):
+                chunk_dir = Path(tmpdir) / file_id / "chunks"
+                chunk_dir.mkdir(parents=True, exist_ok=True)
+                for i in range(2):
+                    chunk_file = chunk_dir / f"Some Book [B0CVCYB19Y]_chunk_{i:03d}.m4a"
+                    chunk_file.write_bytes(b'new chunk')
+                return MagicMock(returncode=0)
+
+            mock_run.side_effect = create_chunks
+
+            result = chunker._split_audio_at_silence(source_file, file_id)
+
+            # Must find the chunks ffmpeg actually created, not fall back to
+            # returning [source_file] as a single unsplit "chunk".
+            assert len(result) == 2
+            assert result != [source_file]
+
     @patch('monkeyplug.utilities.FFmpegRunner.get_audio_duration')
     @patch('monkeyplug.utilities.FFmpegRunner.detect_silence_points')
     def test_handles_no_silence_found(self, mock_detect, mock_duration):
