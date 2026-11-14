@@ -61,7 +61,7 @@ exist? → skip it":
   CONSTRAINTS, DON'T, VERIFICATION, DEVLOG.
 - The **Restatement Gate** (`PLAN_CORE.md §0`), tier classification, and the
   no-conditional-branches rule.
-- Cross-cutting rules **R1–R7** (`PLAN_CORE.md §2`).
+- Cross-cutting rules **R1–R14** (`PLAN_CORE.md §2`; R7 is the Tier 2/3 plan-validation dispatch, §8.7).
 - **KB writeback** (`AGENTS.md` — commit in the same session), and the
   `EXECUTION_PROTOCOL.md §1.5` persistence rule (artifacts in the project tree,
   never `/tmp`).
@@ -129,8 +129,8 @@ proceed with the normal framework and do not add Ponytail-specific steps.
 
 ## PT5. Ponytail Checklist (extends PLAN_CORE §12)
 
-In addition to the universal checklist and the **R1–R7** expectations
-(`PLAN_CORE.md §2`), verify:
+In addition to the universal checklist and the **R1–R14** expectations
+(`PLAN_CORE.md §2`; R7 is the Tier 2/3 plan-validation dispatch, §8.7), verify:
 
 - [ ] No plan task instructs the executor to omit a rung-0 item (PT2) on the
       grounds that it is unnecessary — plan structure, devlog, persistence,

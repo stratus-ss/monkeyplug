@@ -137,3 +137,7 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+# Framework telemetry (local-only; emitted by agent_planning/scripts/)
+agent_planning/execution/_telemetry.jsonl
+# Single-pass review ledger (local-only; enforces one review per plan)
+agent_planning/execution/_review_ledger.jsonl
