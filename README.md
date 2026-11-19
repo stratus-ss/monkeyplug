@@ -9,6 +9,7 @@
    - [Whisper](https://openai.com/research/whisper) ([GitHub](https://github.com/openai/whisper)) - Local Whisper processing
    - [Vosk](https://alphacephei.com/vosk/)-[API](https://github.com/alphacep/vosk-api) - Local Vosk processing
    - [Whisper-WebUI](https://github.com/jhj0517/Whisper-WebUI) - Remote transcription service (tested and supported)
+   - [qwen3-asr](https://huggingface.co/Qwen/Qwen3-ASR-1.7B) - Remote transcription service exposing the qwen3-asr job API
 3. Each recognized word is checked against a [list](./src/monkeyplug/swears.txt) of profanity or other words you'd like muted (supports text or [JSON format](./SWEARS_JSON_FORMAT.md))
 4. Words are only censored if the speech recognition confidence level meets or exceeds the threshold (default: 65%, configurable via `--confidence-threshold`)
 5. [`ffmpeg`](https://www.ffmpeg.org/) is used to create a cleaned audio file, muting or "bleeping" the objectional words
@@ -61,7 +62,7 @@ options:
   -h, --help            show this help message and exit
   -v [true|false], --verbose [true|false]
                         Verbose/debug output
-  -m, --mode <string>   Speech recognition engine (whisper|vosk|remote-whisper) (default: whisper)
+  -m, --mode <string>   Speech recognition engine (whisper|vosk|remote-whisper|remote-qwen3-asr) (default: whisper)
   -i, --input <string>  Input file (or URL)
   -o, --output <string>
                         Output file
@@ -132,7 +133,7 @@ Whisper Options:
   --torch-threads <int>
                         Number of threads used by torch for CPU inference (0)
 
-Remote Whisper Options (for Whisper-WebUI):
+Remote Transcription Options (Whisper-WebUI or qwen3-asr):
   --remote-whisper-url <string>
                         Remote Whisper-WebUI service URL (e.g., http://localhost:8000)
   --remote-whisper-timeout <int>
@@ -150,6 +151,24 @@ You can use a remote [Whisper-WebUI](https://github.com/jhj0517/Whisper-WebUI) s
 - You have a centralized transcription service in your infrastructure
 
 **Note**: This feature is specifically designed for and tested with [Whisper-WebUI](https://github.com/jhj0517/Whisper-WebUI). While it may work with other Whisper backends that provide compatible REST API endpoints, those have not been tested.
+
+### Using Remote Transcription with qwen3-asr
+
+`--mode remote-qwen3-asr` talks to a service exposing the qwen3-asr job API
+(`POST /v1/jobs`, `GET /v1/jobs/{id}`) instead of Whisper-WebUI's
+`/transcription/` + `/task/` pair. The URL is the same flag:
+
+```bash
+monkeyplug.py --mode remote-qwen3-asr --remote-whisper-url http://kids-server:8081 \
+  -i input.mp3 -o output.mp3 -w swears.txt
+```
+
+For long files the job route is the only practical one: the blocking
+`/v1/transcribe` route holds the HTTP request open for the whole file. Jobs are
+kept in the service's memory, so a service restart mid-job answers `404` and
+monkeyplug fails the audio rather than waiting forever. If the backend reports
+`done` with no word timings, monkeyplug also fails rather than emitting audio
+that was never checked for profanity.
 
 #### Using Remote Mode
 
