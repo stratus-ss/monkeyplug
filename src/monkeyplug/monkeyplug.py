@@ -92,7 +92,11 @@ MUTAGEN_METADATA_TAG_VALUE = u'monkeyplug'
 SPEECH_REC_MODE_VOSK = "vosk"
 SPEECH_REC_MODE_WHISPER = "whisper"
 SPEECH_REC_MODE_REMOTE_WHISPER = "remote-whisper"
+SPEECH_REC_MODE_REMOTE_QWEN3_ASR = "remote-qwen3-asr"
 DEFAULT_SPEECH_REC_MODE = os.getenv("MONKEYPLUG_MODE", SPEECH_REC_MODE_WHISPER)
+REMOTE_BACKEND_WHISPER_WEBUI = "whisper-webui"
+REMOTE_BACKEND_QWEN3_ASR = "qwen3-asr"
+REMOTE_BACKENDS = (REMOTE_BACKEND_WHISPER_WEBUI, REMOTE_BACKEND_QWEN3_ASR)
 DEFAULT_VOSK_MODEL_DIR = os.getenv(
     "VOSK_MODEL_DIR", os.path.join(os.path.join(os.path.join(os.path.expanduser("~"), '.cache'), 'vosk'))
 )
@@ -887,6 +891,7 @@ class WhisperPlugger(Plugger):
     whisper = None
     transcript = None
     remote_url = None
+    remote_backend = REMOTE_BACKEND_WHISPER_WEBUI
     api_timeout = 600
     poll_interval = 5
 
@@ -904,6 +909,7 @@ class WhisperPlugger(Plugger):
         inputTranscript=None,
         saveTranscript=False,
         remoteUrl=None,
+        remoteBackend=None,
         apiTimeout=600,
         pollInterval=5,
         forceRetranscribe=False,
@@ -938,12 +944,25 @@ class WhisperPlugger(Plugger):
                 if verbose:
                     mmguero.eprint(f'Adding http:// to URL: {original_url} -> {remoteUrl}')
         self.remote_url = remoteUrl
+        self.remote_backend = remoteBackend or REMOTE_BACKEND_WHISPER_WEBUI
+        if self.remote_backend not in REMOTE_BACKENDS:
+            raise ValueError(
+                f"Unsupported remote transcription backend {self.remote_backend!r} "
+                f"(expected one of: {', '.join(REMOTE_BACKENDS)})"
+            )
         self.api_timeout = apiTimeout
         self.poll_interval = pollInterval
 
         self.whisper = None
         self.model = None
         self.torch = None
+
+        # qwen3-asr is remote-only: there is no local model to fall back to.
+        if (not inputTranscript) and (self.remote_backend == REMOTE_BACKEND_QWEN3_ASR) and (not self.remote_url):
+            raise ValueError(
+                "The qwen3-asr backend requires a remote URL "
+                "(--remote-whisper-url / REMOTE_WHISPER_URL)"
+            )
 
         # Only load model if we're actually going to transcribe (no input transcript provided)
         if not inputTranscript:
@@ -999,7 +1018,8 @@ class WhisperPlugger(Plugger):
             if inputTranscript:
                 self.logger.info(f'Using input transcript (skipping speech recognition)')
             elif self.remote_url:
-                self.logger.info(f'Remote Whisper URL: {self.remote_url}')
+                self.logger.info(f'Remote transcription URL: {self.remote_url}')
+                self.logger.info(f'Remote backend: {self.remote_backend}')
                 self.logger.info(f'API Timeout: {self.api_timeout}')
                 self.logger.info(f'Poll Interval: {self.poll_interval}')
             else:
@@ -1045,14 +1065,131 @@ class WhisperPlugger(Plugger):
                         self.wordList.append(word)
 
     def _RecognizeSpeechRemote(self):
-        """Remote Whisper transcription using async task pattern"""
+        """Remote transcription: Whisper-WebUI or qwen3-asr, per remote_backend."""
         try:
+            if self.remote_backend == REMOTE_BACKEND_QWEN3_ASR:
+                self._RecognizeSpeechQwen3Asr()
+                return
             task_id = self._upload_audio_for_transcription()
             result = self._poll_for_transcription_result(task_id)
             self._extract_words_from_result(result)
         except requests.exceptions.RequestException as e:
             mmguero.eprint(f"Error communicating with remote service: {e}")
             raise
+
+    def _RecognizeSpeechQwen3Asr(self):
+        """qwen3-asr job API: POST /v1/jobs, then poll GET /v1/jobs/{id}.
+
+        Jobs are the only sane route for audiobook-sized audio: the blocking
+        /v1/transcribe route holds the request open for the whole file. A job
+        id is in-memory server-side, so a restart answers 404 rather than a
+        job that never finishes -- report that instead of polling forever.
+        """
+        job_id = self._upload_audio_for_qwen3_job()
+        words = self._poll_for_qwen3_job(job_id)
+        self._extract_words_from_qwen3_result(words)
+
+    def _upload_audio_for_qwen3_job(self):
+        """Upload audio to qwen3-asr and return its job id."""
+        # qwen3-asr takes `language` as a FORM field (not a query param, unlike
+        # Whisper-WebUI's remoteParams). Accept either key so callers that
+        # already speak Whisper-WebUI's `lang` keep working.
+        language = self.remoteParams.get('language') or self.remoteParams.get('lang')
+        data = {}
+        if language:
+            data['language'] = language
+
+        with open(self.inputFileSpec, 'rb') as f:
+            if self.debug:
+                self.logger.info(f'Uploading to {self.remote_url}/v1/jobs')
+            response = requests.post(
+                f'{self.remote_url}/v1/jobs',
+                files={'file': f},
+                data=data,
+                timeout=self.api_timeout,
+            )
+            response.raise_for_status()
+            response_data = response.json()
+
+        job_id = response_data.get('job_id')
+        if not job_id:
+            raise ValueError(f"No job id in qwen3-asr response: {response_data}")
+
+        if self.debug:
+            mmguero.eprint(f'qwen3-asr job id: {job_id}')
+
+        return job_id
+
+    def _poll_for_qwen3_job(self, job_id):
+        """Poll qwen3-asr until the job finishes and return its word list."""
+        import time
+
+        start_time = time.monotonic()
+        last_progress = None
+
+        while True:
+            elapsed = time.monotonic() - start_time
+            if elapsed > self.api_timeout:
+                raise TimeoutError(
+                    f'qwen3-asr job {job_id} did not complete within '
+                    f'{self.api_timeout}s (elapsed {elapsed:.0f}s). The job may '
+                    f'have been orphaned by a server-side restart.'
+                )
+
+            response = requests.get(f'{self.remote_url}/v1/jobs/{job_id}')
+            if response.status_code == 404:
+                raise RuntimeError(
+                    f'qwen3-asr does not know job {job_id} (404). Jobs are '
+                    f'server-side memory only, so the service was probably '
+                    f'restarted mid-transcription.'
+                )
+            response.raise_for_status()
+            data = response.json()
+
+            status = data.get('status')
+            if self.debug:
+                progress = (status, data.get('done'), data.get('total'))
+                if progress != last_progress:
+                    last_progress = progress
+                    mmguero.eprint(
+                        f'qwen3-asr status: {status} ({data.get("done", 0)}/{data.get("total", 0)} chunks)'
+                    )
+
+            if status == 'done':
+                words = data.get('words') or []
+                if not words:
+                    # An empty word list would silently produce an UNCENSORED
+                    # book, which is worse than failing the job.
+                    raise RuntimeError(
+                        f'qwen3-asr job {job_id} finished with no word timings; '
+                        f'refusing to emit audio that was never checked for profanity'
+                    )
+                return words
+            if status == 'error':
+                raise RuntimeError(
+                    f'qwen3-asr transcription failed: {data.get("error") or "unknown error"}'
+                )
+
+            time.sleep(self.poll_interval)
+
+    def _extract_words_from_qwen3_result(self, words):
+        """Map qwen3-asr's aligner output ({word,start,end}) onto wordList.
+
+        qwen3-asr does not report per-word confidence; the forced aligner gives
+        timings only. Confidence 1.0 is honest here: _should_scrub_word scrubs
+        on an exact swear-list match regardless of confidence.
+        """
+        for word in words:
+            word_text = (word.get('word') or '').strip()
+            if not word_text:
+                continue
+            self.wordList.append({
+                'word': word_text,
+                'start': word.get('start', 0),
+                'end': word.get('end', 0),
+                'conf': 1.0,
+                'scrub': self._should_scrub_word(word_text, 1.0),
+            })
 
     def _upload_audio_for_transcription(self):
         """Upload audio file to remote service and get task ID"""
@@ -1205,7 +1342,7 @@ def RunMonkeyPlug():
         metavar="<string>",
         type=str,
         default=DEFAULT_SPEECH_REC_MODE,
-        help=f"Speech recognition engine ({SPEECH_REC_MODE_WHISPER}|{SPEECH_REC_MODE_VOSK}|{SPEECH_REC_MODE_REMOTE_WHISPER}) (default: {DEFAULT_SPEECH_REC_MODE})",
+        help=f"Speech recognition engine ({SPEECH_REC_MODE_WHISPER}|{SPEECH_REC_MODE_VOSK}|{SPEECH_REC_MODE_REMOTE_WHISPER}|{SPEECH_REC_MODE_REMOTE_QWEN3_ASR}) (default: {DEFAULT_SPEECH_REC_MODE})",
     )
     parser.add_argument(
         "-i",
@@ -1235,22 +1372,6 @@ def RunMonkeyPlug():
         required=False,
         metavar="<string>",
         help="Output file to store transcript JSON",
-    )
-    parser.add_argument(
-        "--input-transcript",
-        dest="inputTranscript",
-        type=str,
-        default=None,
-        required=False,
-        metavar="<string>",
-        help="Load existing transcript JSON instead of performing speech recognition",
-    )
-    parser.add_argument(
-        "--save-transcript",
-        dest="saveTranscript",
-        action="store_true",
-        default=False,
-        help="Automatically save transcript JSON alongside output audio file (default: true)",
     )
     parser.add_argument(
         "--report-format",
@@ -1599,13 +1720,27 @@ def RunMonkeyPlug():
             verbose=args.verbose,
         )
 
-    elif args.speechRecMode in [SPEECH_REC_MODE_WHISPER, SPEECH_REC_MODE_REMOTE_WHISPER]:
-        # Use remote if mode is remote-whisper OR if remote URL is provided
-        use_remote = (args.speechRecMode == SPEECH_REC_MODE_REMOTE_WHISPER) or args.remoteWhisperUrl
+    elif args.speechRecMode in [
+        SPEECH_REC_MODE_WHISPER,
+        SPEECH_REC_MODE_REMOTE_WHISPER,
+        SPEECH_REC_MODE_REMOTE_QWEN3_ASR,
+    ]:
+        # Use remote if mode is a remote mode OR if remote URL is provided
+        remote_backend = (
+            REMOTE_BACKEND_QWEN3_ASR
+            if args.speechRecMode == SPEECH_REC_MODE_REMOTE_QWEN3_ASR
+            else REMOTE_BACKEND_WHISPER_WEBUI
+        )
+        use_remote = (
+            args.speechRecMode in (SPEECH_REC_MODE_REMOTE_WHISPER, SPEECH_REC_MODE_REMOTE_QWEN3_ASR)
+        ) or args.remoteWhisperUrl
         
         if use_remote:
             if not args.remoteWhisperUrl:
-                raise ValueError("Remote Whisper URL must be specified with --remote-whisper-url or REMOTE_WHISPER_URL environment variable")
+                raise ValueError(
+                    "A remote transcription URL must be specified with --remote-whisper-url "
+                    "or REMOTE_WHISPER_URL environment variable"
+                )
             remote_url = args.remoteWhisperUrl
         else:
             pathlib.Path(args.whisperModelDir).mkdir(parents=True, exist_ok=True)
@@ -1624,6 +1759,7 @@ def RunMonkeyPlug():
             inputTranscript=args.inputTranscript,
             saveTranscript=args.saveTranscript,
             remoteUrl=remote_url,
+            remoteBackend=remote_backend,
             apiTimeout=args.remoteWhisperTimeout,
             pollInterval=args.remoteWhisperPollInterval,
             forceRetranscribe=args.forceRetranscribe,
