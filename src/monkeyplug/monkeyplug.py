@@ -1136,7 +1136,9 @@ class WhisperPlugger(Plugger):
                     f'have been orphaned by a server-side restart.'
                 )
 
-            response = requests.get(f'{self.remote_url}/v1/jobs/{job_id}')
+            response = requests.get(
+                f'{self.remote_url}/v1/jobs/{job_id}', timeout=self.api_timeout
+            )
             if response.status_code == 404:
                 raise RuntimeError(
                     f'qwen3-asr does not know job {job_id} (404). Jobs are '
